@@ -1,0 +1,13 @@
+# Built binaries (rebuild with ./run.sh)
+/attn
+/flash
+/sanity
+/tolerance_probe
+*.o
+
+# Vendored qemu-aarch64-static (~145 MB) -- fetch without root per README:
+#   cd qemu_pkg && apt-get download qemu-user-static && dpkg-deb -x qemu-user-static_*.deb ./extracted
+/qemu_pkg/
+
+# Vendored python tooling (clang-format etc.)
+/.pytools/

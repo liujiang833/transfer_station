@@ -1,0 +1,16 @@
+=== bf16 attention kernel verification (BFDOT vs BFMMLA vs fp32 ref) ===
+MHA prefill      H=4/4 (g1) Sq=8    Sk=8    D= 64 full  | err/scale dot=1.8e-03 mma=1.8e-03 d-vs-m=6e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+MHA prefil.causal H=4/4 (g1) Sq=8    Sk=8    D= 64 causal | err/scale dot=1.6e-03 mma=1.6e-03 d-vs-m=6e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+GQA prefill      H=8/2 (g4) Sq=8    Sk=8    D= 64 full  | err/scale dot=2.0e-03 mma=2.0e-03 d-vs-m=6e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+GQA prefil.causal H=8/2 (g4) Sq=8    Sk=8    D= 64 causal | err/scale dot=2.5e-03 mma=2.5e-03 d-vs-m=6e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+MHA decode(Sq=1) H=4/4 (g1) Sq=1    Sk=16   D= 64 full  | err/scale dot=1.8e-03 mma=1.8e-03 d-vs-m=3e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+GQA decode(Sq=1) H=8/2 (g4) Sq=1    Sk=16   D= 64 full  | err/scale dot=2.5e-03 mma=2.5e-03 d-vs-m=1e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+MQA prefill      H=8/1 (g8) Sq=8    Sk=8    D= 64 full  | err/scale dot=2.1e-03 mma=2.1e-03 d-vs-m=3e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+GQA odd shapes   H=6/3 (g2) Sq=5    Sk=7    D= 40 causal | err/scale dot=2.1e-03 mma=2.1e-03 d-vs-m=0e+00 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+GQA big head_dim H=8/2 (g4) Sq=4    Sk=12   D=128 full  | err/scale dot=2.0e-03 mma=2.0e-03 d-vs-m=3e-08 | 0.00 GFLOP  mma 0.00s dot 0.00s -> PASS
+--- long-sequence prefill (target 1k/2k/4k, D=128, causal) ---
+prefill 1k MHA   H=1/1 (g1) Sq=1024 Sk=1024 D=128 causal | err/scale dot=1.9e-03 mma=1.9e-03 d-vs-m=3e-05 | 0.54 GFLOP  mma 5.60s dot 3.56s [ref:subset] -> PASS
+prefill 1k GQA   H=4/1 (g4) Sq=1024 Sk=1024 D=128 causal | err/scale dot=1.9e-03 mma=1.9e-03 d-vs-m=1e-04 | 2.15 GFLOP  mma 19.84s dot 24.29s [ref:subset] -> PASS
+prefill 2k MHA   H=1/1 (g1) Sq=2048 Sk=2048 D=128 causal | err/scale dot=1.9e-03 mma=1.9e-03 d-vs-m=2e-05 | 2.15 GFLOP  mma 20.00s dot 21.84s [ref:subset] -> PASS
+prefill 4k MHA   H=1/1 (g1) Sq=4096 Sk=4096 D=128 causal | err/scale dot=1.3e-03 mma=1.3e-03 d-vs-m=8e-06 | 8.59 GFLOP  mma 83.91s dot 89.74s [ref:subset] -> PASS
+=== ALL PASS ===
