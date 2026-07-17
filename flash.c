@@ -7,6 +7,14 @@
  * where alpha = exp(m_old - m_new). Memory is O(Bq*D + Bq*Bk), not O(Sq*Sk).
  * Key-blocks wholly in the causal future are skipped (and end the k-loop).
  *
+ * ALLOCATION-FREE: attn_flash() mallocs nothing. The caller sizes ONE block with
+ * attn_flash_scratch_bytes(D), aligns it to ATTN_SCRATCH_ALIGN, and passes it in.
+ * That size depends only on head_dim -- it is O(Bq*D + Bq*Bk) and never O(Sq*Sk),
+ * which is exactly the property above -- so a driver allocates one buffer per thread
+ * and reuses it for every sequence length, prefill and decode alike. The size query
+ * IS attn_flash_layout()'s measuring pass, so the reported size and the carve the
+ * kernel performs cannot drift apart. See the scratch section above attn_flash().
+ *
  * SVE ONLY (arm_sve.h): no NEON, no SME/ZA. svbfdot_f32 is the single compute
  * primitive for BOTH QK^T and P.V. VL-agnostic: every loop is driven by
  * svcntw()/svcnth()/svwhilelt at runtime; nothing is hardcoded to a vector width.
@@ -341,9 +349,83 @@ static void softmax_block(float *S, uint16_t *Pb, float *m, float *l, float *al,
     }
 }
 
+/* ---------------- scratch: the kernel allocates NOTHING ----------------
+ * Every buffer attn_flash() touches is carved out of one caller-owned block. The
+ * driver sizes it with attn_flash_scratch_bytes(D) and hands the same block back on
+ * every call; the kernel never mallocs, never frees, and keeps no state across calls
+ * (it initialises everything it reads).
+ *
+ * The extents depend ONLY on D: BQ/BK are compile-time constants, and the working set
+ * is O(BQ*D + BQ*BK), never O(Sq*Sk) -- that IS flash attention's memory property, so
+ * the scratch is INDEPENDENT of Sq and Sk. One buffer per (thread, head_dim) serves
+ * every sequence length: allocate at driver start-up, reuse for 1-token decode and 4k
+ * prefill alike, free at shutdown.
+ *
+ * ONE SOURCE OF TRUTH, deliberately: attn_flash_layout() both measures and carves, and
+ * attn_flash_scratch_bytes() is literally its measuring pass. A hand-written size sum
+ * kept next to a separate carve is how you get a silent heap overflow -- the two drift,
+ * nothing complains, and the kernel scribbles past the end. There is no second copy of
+ * these sizes anywhere; do not add one.
+ */
+#define ATTN_SCRATCH_ALIGN 64 /* cache line. EVERY sub-buffer starts on a multiple of it:
+                               * the carve mixes uint16_t and float tiles whose natural
+                               * sizes depend on D, so without padding a sub-buffer's
+                               * start would wander with D and SVE loads would straddle
+                               * lines. The caller's block must be this aligned too. */
+
+/* Sub-buffers, in carve order. "*2" is bytes-per-bf16; strides are the kernel's
+ * (Sstride == Pstride == Vstride == BK):
+ *   Vt [D x BK] bf16   packed V^T      Pb [BQ x BK] bf16  softmax probs P
+ *   S  [BQ x BK] f32   score tile      pv [D] f32         one row's P*V partial
+ *   acc [BQ x D] f32   running output  m, l, al [BQ] f32  online-softmax state
+ */
+struct attn_scratch {
+    uint16_t *Vt, *Pb;
+    float *S, *pv, *acc, *m, *l, *al;
+};
+
+/* Carve one sub-buffer: round the running offset up to ATTN_SCRATCH_ALIGN, hand back
+ * that slot (NULL when only measuring), then advance past nbytes. */
+static inline void *attn_carve(void *base, size_t *off, size_t nbytes) {
+    size_t a = ATTN_SCRATCH_ALIGN;
+    *off = (*off + a - 1) & ~(a - 1);
+    void *p = base ? (void *)((char *)base + *off) : NULL;
+    *off += nbytes;
+    return p;
+}
+
+/* THE layout -- the only place these sizes exist. base==NULL measures; base!=NULL also
+ * carves into base and fills *s. Returns total bytes, INCLUDING the inter-buffer
+ * alignment padding, rounded up to ATTN_SCRATCH_ALIGN: that makes the result a legal
+ * aligned_alloc() size (C11 wants size % alignment == 0) and keeps an array of
+ * scratches aligned. Both callers -- the size query and attn_flash -- come through
+ * here, so the reported size always covers the exact carve the kernel performs. */
+static size_t attn_flash_layout(void *base, int D, struct attn_scratch *s) {
+    struct attn_scratch discard; /* measure-only callers pass s == NULL */
+    if (!s)
+        s = &discard;
+    size_t off = 0, a = ATTN_SCRATCH_ALIGN;
+    s->Vt = attn_carve(base, &off, (size_t)D * BK * 2);
+    s->Pb = attn_carve(base, &off, (size_t)BQ * BK * 2);
+    s->S = attn_carve(base, &off, sizeof(float) * BQ * BK);
+    s->pv = attn_carve(base, &off, sizeof(float) * D);
+    s->acc = attn_carve(base, &off, sizeof(float) * BQ * D);
+    s->m = attn_carve(base, &off, sizeof(float) * BQ);
+    s->l = attn_carve(base, &off, sizeof(float) * BQ);
+    s->al = attn_carve(base, &off, sizeof(float) * BQ);
+    return (off + a - 1) & ~(a - 1);
+}
+
+/* Bytes of scratch attn_flash() needs for this head_dim. Independent of Sq/Sk -- see
+ * the scratch note above. The caller's buffer must be ATTN_SCRATCH_ALIGN-aligned
+ * (aligned_alloc / posix_memalign); run_case() shows the intended driver pattern. */
+size_t attn_flash_scratch_bytes(int D) {
+    return attn_flash_layout(NULL, D, NULL);
+}
+
 /* ---------------- flash attention forward ---------------- */
 static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, float *O, int Hq,
-                       int Hkv, int Sq, int Sk, int D, int causal) {
+                       int Hkv, int Sq, int Sk, int D, int causal, void *scratch) {
     /* Naming legend:
      *   Hq/Hkv     - number of query / key-value heads; group = Hq/Hkv (q-heads per kv-head)
      *   Sq/Sk      - query / key sequence lengths;  D = head_dim
@@ -358,6 +440,10 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
      *   l[i]       - running softmax denominator (running sum of exp)
      *   acc[i*D+.] - running UNnormalised output (running sum of P*V)
      *   al[i]      - this block's rescale factor alpha = exp(m_old - m_new)
+     *   scratch    - CALLER-OWNED block, >= attn_flash_scratch_bytes(D) bytes and
+     *                ATTN_SCRATCH_ALIGN-aligned. Every tile below is carved from it by
+     *                attn_flash_layout(); this kernel allocates nothing. Its size needs
+     *                only D, so one block per thread serves every Sq/Sk (see header).
      * Scratch tiles (reused every block); "*2" is bytes-per-bf16:
      *   Vt         - packed V^T block (feature-major), row stride Vstride=BK. Only pack.
      *   S          - score tile [BQ x Sstride] fp32
@@ -368,10 +454,11 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
     int group = Hq / Hkv; /* query heads sharing one kv head */
     float scale = 1.0f / sqrtf((float)D);
     int Sstride = BK, Pstride = BK, Vstride = BK; /* real extents + predication: no padding */
-    uint16_t *Vt = malloc((size_t)D * Vstride * 2), *Pb = malloc((size_t)BQ * Pstride * 2);
-    float *S = malloc(sizeof(float) * BQ * Sstride), *pv = malloc(sizeof(float) * D);
-    float *acc = malloc(sizeof(float) * BQ * D), *m = malloc(sizeof(float) * BQ);
-    float *l = malloc(sizeof(float) * BQ), *al = malloc(sizeof(float) * BQ);
+    struct attn_scratch s;
+    attn_flash_layout(scratch, D, &s); /* the very carve attn_flash_scratch_bytes() sized */
+    uint16_t *Vt = s.Vt, *Pb = s.Pb;
+    float *S = s.S, *pv = s.pv;
+    float *acc = s.acc, *m = s.m, *l = s.l, *al = s.al;
 
     for (int h = 0; h < Hq; h++) {
         int kv = h / group; /* kv head feeding this query head */
@@ -412,14 +499,7 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
             }
         }
     }
-    free(Vt);
-    free(Pb);
-    free(S);
-    free(pv);
-    free(acc);
-    free(m);
-    free(l);
-    free(al);
+    /* No frees: every buffer above is the caller's. */
 }
 
 /* ---------------- harness ---------------- */
@@ -517,8 +597,15 @@ static int run_case(const char *name, int Hq, int Hkv, int Sq, int Sk, int D, in
     int *rows = malloc(sizeof(int) * Sq);
     int nrows = ref_rowset(Sq, ref_cap, rows);
     attn_ref(Q, K, V, Oref, Hq, Hkv, Sq, Sk, D, causal, rows, nrows);
+    /* Intended DRIVER pattern for the allocation-free kernel: ask for the size, get one
+     * ATTN_SCRATCH_ALIGN-aligned block, hand it to every attn_flash() call, free it at
+     * the end. The size needs only D -- not Sq/Sk -- so a real driver hoists this out of
+     * the sequence loop and keeps one block per thread for the process's lifetime. The
+     * alignment is a contract, not a nicety: aligned_alloc(), never plain malloc(). */
+    size_t sbytes = attn_flash_scratch_bytes(D);
+    void *scratch = aligned_alloc(ATTN_SCRATCH_ALIGN, sbytes);
     double t0 = now_s();
-    attn_flash(Q, K, V, Odot, Hq, Hkv, Sq, Sk, D, causal);
+    attn_flash(Q, K, V, Odot, Hq, Hkv, Sq, Sk, D, causal, scratch);
     double tdot = now_s() - t0;
 
     /* NaN-SAFETY, deliberate: a NaN loses EVERY ordered comparison, so it neither
@@ -572,6 +659,7 @@ static int run_case(const char *name, int Hq, int Hkv, int Sq, int Sk, int D, in
     free(Oref);
     free(Odot);
     free(rows);
+    free(scratch);
     return ok;
 }
 

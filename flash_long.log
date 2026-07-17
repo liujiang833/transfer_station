@@ -1,18 +1,18 @@
 # flash --long : Qwen3 1k/2k/4k sweep, SVE BFDOT kernel
-# regenerated 2026-07-16 20:11:20 +0800 from the SHIPPED flash.c (md5 55536a6b5f950298a29f7697213ae8ab)
+# regenerated 2026-07-17 09:13:21 +0800 from the SHIPPED flash.c (md5 78d9a6fe186d11cca5cc03378f4ce6ee)
 # host: aarch64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0 | qemu 8.2.2 -cpu max
 
 === FLASH bf16 attention (online softmax, SVE BFDOT vs fp32 ref) ===
 SVE VL: svcntw()=16 f32 lanes, svcnth()=32 bf16 lanes (runtime, not hardcoded)
-MHA prefill       H= 4/4 (g1) Sq=8    Sk=8    D= 64 full   | err/scale=1.4e-03 |    0.00 GFLOP    0.00s  0.02 GFLOP/s -> PASS
-MHA prefil.causal H= 4/4 (g1) Sq=8    Sk=8    D= 64 causal | err/scale=9.4e-04 |    0.00 GFLOP    0.00s  0.01 GFLOP/s -> PASS
+MHA prefill       H= 4/4 (g1) Sq=8    Sk=8    D= 64 full   | err/scale=1.4e-03 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
+MHA prefil.causal H= 4/4 (g1) Sq=8    Sk=8    D= 64 causal | err/scale=9.4e-04 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
 GQA prefill       H= 8/2 (g4) Sq=8    Sk=8    D= 64 full   | err/scale=1.5e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
 GQA prefil.causal H= 8/2 (g4) Sq=8    Sk=8    D= 64 causal | err/scale=1.3e-03 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
-MHA decode(Sq=1)  H= 4/4 (g1) Sq=1    Sk=16   D= 64 full   | err/scale=1.1e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
-GQA decode(Sq=1)  H= 8/2 (g4) Sq=1    Sk=16   D= 64 full   | err/scale=1.7e-03 |    0.00 GFLOP    0.00s  0.06 GFLOP/s -> PASS
+MHA decode(Sq=1)  H= 4/4 (g1) Sq=1    Sk=16   D= 64 full   | err/scale=1.1e-03 |    0.00 GFLOP    0.00s  0.06 GFLOP/s -> PASS
+GQA decode(Sq=1)  H= 8/2 (g4) Sq=1    Sk=16   D= 64 full   | err/scale=1.7e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
 MQA prefill       H= 8/1 (g8) Sq=8    Sk=8    D= 64 full   | err/scale=1.6e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
 odd + multiblock  H= 6/3 (g2) Sq=130  Sk=70   D= 40 causal | err/scale=1.3e-03 |    0.00 GFLOP    0.10s  0.02 GFLOP/s -> PASS
-GQA big head_dim  H= 8/2 (g4) Sq=4    Sk=12   D=128 full   | err/scale=1.5e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
+GQA big head_dim  H= 8/2 (g4) Sq=4    Sk=12   D=128 full   | err/scale=1.5e-03 |    0.00 GFLOP    0.00s  0.06 GFLOP/s -> PASS
 --- Qwen3 prefill sweep: Hq=16 Hkv=8 (GQA group=2) D=128 causal ---
   Covers BOTH Qwen3-0.6B AND Qwen3-1.7B: their attention shapes are identical
   (16 Q heads / 8 KV heads / head_dim 128 / 28 layers). Only hidden_size differs
@@ -24,11 +24,11 @@ GQA big head_dim  H= 8/2 (g4) Sq=4    Sk=12   D=128 full   | err/scale=1.5e-03 |
   sequence, incl. row Sq-1 -- which attends all Sk keys and so walks every key
   block and every online-softmax rescale. (A prefix of N rows would be causal-
   masked down to an NxN corner of the FIRST key block: same cost, no coverage.)
-qwen3 1k          H=16/8 (g2) Sq=1024 Sk=1024 D=128 causal | err/scale=2.9e-04 |    4.30 GFLOP   54.56s  0.08 GFLOP/s [ref:8 rows spread 0..1023] -> PASS
-qwen3 2k          H=16/8 (g2) Sq=2048 Sk=2048 D=128 causal | err/scale=2.1e-04 |   17.19 GFLOP  217.24s  0.08 GFLOP/s [ref:8 rows spread 0..2047] -> PASS
-qwen3 4k          H=16/8 (g2) Sq=4096 Sk=4096 D=128 causal | err/scale=1.5e-04 |   68.74 GFLOP  878.64s  0.08 GFLOP/s [ref:8 rows spread 0..4095] -> PASS
+qwen3 1k          H=16/8 (g2) Sq=1024 Sk=1024 D=128 causal | err/scale=2.9e-04 |    4.30 GFLOP   54.80s  0.08 GFLOP/s [ref:8 rows spread 0..1023] -> PASS
+qwen3 2k          H=16/8 (g2) Sq=2048 Sk=2048 D=128 causal | err/scale=2.1e-04 |   17.19 GFLOP  214.24s  0.08 GFLOP/s [ref:8 rows spread 0..2047] -> PASS
+qwen3 4k          H=16/8 (g2) Sq=4096 Sk=4096 D=128 causal | err/scale=1.5e-04 |   68.74 GFLOP  853.06s  0.08 GFLOP/s [ref:8 rows spread 0..4095] -> PASS
 === ALL PASS ===
 
-real	19m13.843s
-user	19m13.331s
-sys	0m0.427s
+real	18m45.413s
+user	18m44.255s
+sys	0m1.120s

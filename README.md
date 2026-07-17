@@ -20,7 +20,7 @@ cross-compiler + QEMU user-mode emulation.
 |---|---|
 | `sanity.c` | **NEON.** Tiny test that pins down BFDOT/BFMMLA operand layout against hand-computed values |
 | `attn.c` | **NEON.** Materialising kernel: fp32 reference + BFDOT path + BFMMLA path + harness |
-| `flash.c` | **SVE-only BFDOT.** Flash-attention kernel: online softmax, key-blocked, O(Bq·D) memory + harness |
+| `flash.c` | **SVE-only BFDOT.** Flash-attention kernel: online softmax, key-blocked, O(Bq·D) memory, **allocation-free** (caller-owned scratch) + harness |
 | `tolerance_probe.c` | Measurement harness behind `flash.c`'s `TOL=8e-3`: prints `err/scale` under per-case / per-head / per-row normalisation and counts NaN reference rows. **Not part of the shipped kernel**; frozen snapshot, build/run lines in its header |
 | `run.sh` | Build all three (AArch64, `-march=armv8.6-a+sve+bf16`) and run under `qemu-aarch64 -cpu max` |
 | `qemu_pkg/` | Locally-extracted `qemu-aarch64-static` (no root needed) |
@@ -181,6 +181,76 @@ Per query-block (`BQ=64`) it keeps only running state — max `m[Bq]`, denominat
 Final `O = acc / l`. Causal key-blocks wholly in the future are skipped (and end
 the k-loop). **Memory is O(Bq·D + Bq·Bk)** (a few tens of KB/head) regardless of
 sequence length — the right shape for long-context prefill.
+
+### Allocation-free: the caller owns the scratch
+
+`attn_flash()` **allocates nothing**. No `malloc`/`free`, no VLA, no large stack
+array (its frame is a compile-time constant) — so it does no heap traffic per call,
+cannot fail for want of memory, and works under an arena/bump allocator or a
+no-malloc-in-the-hot-path policy. The caller passes one scratch block:
+
+```c
+/* Bytes of scratch attn_flash() needs for this head_dim. */
+size_t attn_flash_scratch_bytes(int D);
+
+/* scratch: caller-owned, >= attn_flash_scratch_bytes(D) bytes, suitably aligned. */
+static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, float *O,
+                       int Hq, int Hkv, int Sq, int Sk, int D, int causal, void *scratch);
+```
+
+**The size depends only on `D` — never on `Sq`/`Sk`.** That is not a convenience, it
+*is* the O(Bq·D + Bq·Bk) property above: `BQ`/`BK` are compile-time constants, so a
+driver allocates **one block per thread at start-up and reuses it for every sequence
+length** — 1-token decode and 4k prefill alike — and frees it at shutdown. The kernel
+keeps no state across calls; it initialises everything it reads.
+
+**Alignment is a contract, not a nicety.** The block must be aligned to
+`ATTN_SCRATCH_ALIGN` (**64 bytes**, a cache line). The carve mixes `uint16_t` and
+`float` tiles whose extents depend on `D`, so each sub-buffer's offset is padded up
+to `ATTN_SCRATCH_ALIGN` — every sub-buffer is 64-byte aligned for **any** `D`, and
+SVE loads never straddle a line. Use `aligned_alloc` / `posix_memalign`, not plain
+`malloc`. The returned size already includes that padding *and* is itself rounded up
+to 64, so it is a legal C11 `aligned_alloc` size.
+
+Driver usage — this is exactly what `run_case()` does:
+
+```c
+size_t sbytes  = attn_flash_scratch_bytes(D);       /* depends on D only */
+void  *scratch = aligned_alloc(ATTN_SCRATCH_ALIGN, sbytes);   /* once, per thread */
+
+for (each request) /* any Sq, any Sk, any causal — same block */
+    attn_flash(Q, K, V, O, Hq, Hkv, Sq, Sk, D, causal, scratch);
+
+free(scratch);                                      /* at shutdown */
+```
+
+**One source of truth.** `attn_flash_layout(base, D, s)` both measures (`base == NULL`)
+and carves; `attn_flash_scratch_bytes()` is literally its measuring pass, and
+`attn_flash()` calls it to carve. The size query and the carve therefore cannot drift
+apart — a hand-written size sum kept beside a separate carve is how you get a silent
+heap overflow. Do not add a second copy of those sizes.
+
+Sizes are small and grow linearly in `D` (measured, `BQ=BK=64`):
+
+| `D` | 1 | 40 | 64 | 128 | 256 |
+|---|---|---|---|---|---|
+| `attn_flash_scratch_bytes(D)` | 25 792 | 40 896 | 50 176 | 75 008 | 124 672 |
+
+Alignment padding costs ≤ 60 bytes total (worst case `D=1`, 0.23%); at `D`=64/128/256
+every extent is already a multiple of 64 and the padding is exactly **0**. Verified for
+`D` ∈ {1, 3, 7, 8, 33, 40, 64, 65, 128, 256}: all 8 sub-buffers in bounds, 64-byte
+aligned, pairwise non-overlapping, and the reported size equals the carve's high-water
+mark exactly (zero slack). Note the shipped 9 cases only use `D`=40/64/128 (padding
+32/0/0), so the `D` whose padding *shifts* the carve are swept separately for
+**numerical** correctness — `D` ∈ {1,2,3,7,8,33,40,64,65,127,128,129,256}, two shapes
+each: **26/26 PASS**, `err/scale` bit-identical to the pre-refactor kernel on all 26.
+Verified at runtime over the whole suite with a 256-byte
+canary past the end (**0 breaches**) and with the scratch pre-poisoned to `0xFF`
+(NaN in every lane) before each call — **9/9 PASS, `err/scale` unchanged**, so the
+kernel never reads scratch it did not initialise. Both guards were fault-injected to
+prove they have teeth: a deliberate 1-byte overflow trips 9/9 canaries (while the
+correctness suite still says `ALL PASS` — which is precisely why the canary exists),
+and deleting the `acc` zero-init trips the NaN counter.
 
 ### Why only V is packed
 
@@ -423,4 +493,7 @@ standard); it was the *reference* that was wrong.
   (plain per-row normalisation is degenerate — see *Known limits*).
 - Give `attn.c` the spread-row reference sample too; its `--long` prefix has the
   same coverage hole `flash.c` just fixed.
-- Cache-blocking / multithreading the flash kernel; tune `BQ`/`BK` per core.
+- Cache-blocking / multithreading the flash kernel; tune `BQ`/`BK` per core. The
+  scratch contract is already the right shape for this — the kernel allocates nothing
+  and touches only the caller's block, so per-thread parallelism needs one
+  `attn_flash_scratch_bytes(D)` block per thread and no other change.
