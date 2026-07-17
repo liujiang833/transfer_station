@@ -1,15 +1,11 @@
-# bf16 Attention Kernel (MHA + GQA) with BFDOT / BFMMLA
+# bf16 Attention Kernel (MHA + GQA) — SVE BFDOT flash attention
 
-A self-contained, **QEMU-verified** attention kernel for AArch64 that computes
-scaled-dot-product attention in **bfloat16** using the Arm BF16 instructions
-`BFDOT` and `BFMMLA`, with an fp32 reference for correctness checking.
+A self-contained, **QEMU-verified** flash-attention kernel for AArch64 that computes
+scaled-dot-product attention in **bfloat16** using the Arm BF16 instruction `BFDOT`,
+with an fp32 reference for correctness checking.
 
-Two kernels live here, and they use *different* instruction sets:
-
-- **`attn.c` — NEON.** Materialises the `[Sq×Sk]` score matrix; selectable
-  BFDOT / BFMMLA compute paths.
-- **`flash.c` — SVE only.** Flash attention with online softmax; `svbfdot_f32`
-  is its single compute primitive. This is the one you'd ship.
+**`flash.c` — SVE only.** Flash attention with online softmax; `svbfdot_f32` is its
+single compute primitive. `arm_sve.h` is the sole ARM header: no NEON, no SME/ZA.
 
 Built and tested on an **x86_64** host (no ARM hardware, no root) via an AArch64
 cross-compiler + QEMU user-mode emulation.
@@ -18,12 +14,21 @@ cross-compiler + QEMU user-mode emulation.
 
 | File | Purpose |
 |---|---|
-| `sanity.c` | **NEON.** Tiny test that pins down BFDOT/BFMMLA operand layout against hand-computed values |
-| `attn.c` | **NEON.** Materialising kernel: fp32 reference + BFDOT path + BFMMLA path + harness |
-| `flash.c` | **SVE-only BFDOT.** Flash-attention kernel: online softmax, key-blocked, O(Bq·D) memory, **allocation-free** (caller-owned scratch) + harness |
-| `tolerance_probe.c` | Measurement harness behind `flash.c`'s `TOL=8e-3`: prints `err/scale` under per-case / per-head / per-row normalisation and counts NaN reference rows. **Not part of the shipped kernel**; frozen snapshot, build/run lines in its header |
-| `run.sh` | Build all three (AArch64, `-march=armv8.6-a+sve+bf16`) and run under `qemu-aarch64 -cpu max` |
+| `flash.c` | **SVE-only BFDOT.** Flash-attention kernel: online softmax, key-blocked with a **runtime** key-block size `bk`, O(Bq·D + Bq·bk) memory, **allocation-free** (caller-owned scratch) + harness |
+| `tolerance_probe.c` | Measurement harness behind `flash.c`'s `TOL=8e-3`: prints `err/scale` under per-case / per-head / per-row normalisation and counts NaN reference rows. **Not part of the shipped kernel**; a **frozen snapshot** with its own private copy of the kernel (still `BK=64`, compile-time) — it is deliberately *not* kept in step with `flash.c`; build/run lines in its header |
+| `run.sh` | Build `flash.c` (AArch64, `-march=armv8.6-a+sve+bf16`) and run it under `qemu-aarch64 -cpu max` |
+| `flash_long.log` | Recorded `./flash --long` output; header cites the md5 of the `flash.c` it came from |
 | `qemu_pkg/` | Locally-extracted `qemu-aarch64-static` (no root needed) |
+
+### Harness modes
+
+```bash
+./flash                  # 9-case short suite at the default bk (128)
+./flash --bk 256         # ...the same suite at any legal bk — NO REBUILD
+./flash --sweep-bk       # tune bk: one shape across bk=32..1024 (see the QEMU caveat)
+./flash --check-pick-bk  # self-test attn_flash_pick_bk's analytical cache model
+./flash --long           # + the Qwen3 1k/2k/4k prefill sweep
+```
 
 ## Build & run
 
@@ -57,8 +62,8 @@ crash, never a warning. And it hides from casual probing — fp16 and bf16 share
 the encoding `0x4000` for `2.0`, so a probe written with only `2.0` looks
 perfectly correct.
 
-This is **why** both kernels store bf16 tensors as `uint16_t` bit patterns and
-reinterpret them to `bfloat16_t*` for the intrinsics. Convert fp32 → bf16 only
+This is **why** the kernel stores bf16 tensors as `uint16_t` bit patterns and
+reinterprets them to `bfloat16_t*` for the intrinsics. Convert fp32 → bf16 only
 via:
 
 - `f32_to_bf16()` — the explicit bit helper, round-to-nearest-even (scalar), or
@@ -67,23 +72,34 @@ via:
 Both are verified correct against a scalar RNE reference (all lanes, 0
 mismatches; round-trip through `svbfdot` exact). Only the C cast is broken.
 
-## The two instructions (NEON / 128-bit forms)
+## Why BFDOT, not BFMMLA
 
-- **`BFDOT`** `vbfdotq_f32(f32x4 acc, bf16x8 a, bf16x8 b)` — 4 output lanes, each a
-  2-element bf16 dot: `acc[k] += a[2k]*b[2k] + a[2k+1]*b[2k+1]`. **8 MACs/instr.**
-  GEMV-friendly (one score / one output element per reduction).
-- **`BFMMLA`** `vbfmmlaq_f32(f32x4 acc, bf16x8 a, bf16x8 b)` — a `[2×4]·[4×2] → [2×2]`
-  matmul-accumulate. `a` holds a **2×4 row-major** tile, `b` holds a **4×2
-  column-major** tile (i.e. `b[0..3]`=col0, `b[4..7]`=col1). **16 MACs/instr.**
-  GEMM-friendly, but needs ≥2 independent rows on *both* operands to be full-rate.
+Arm's two BF16 matmul instructions differ in the layout they *demand* of their
+operands, and that is what picks the design here:
 
-`sanity.c` verifies both layouts (`BFDOT → 22 38 38 22`, `BFMMLA → [5 5; 13 13]`).
+- **`BFDOT`** — 4 output lanes, each a 2-element bf16 dot:
+  `acc[k] += a[2k]*b[2k] + a[2k+1]*b[2k+1]`. **8 MACs/instr** (128-bit form).
+  GEMV-friendly: one score / one output element per reduction, and it imposes **no
+  layout constraint** on either operand — it dots whatever two vectors it is handed.
+- **`BFMMLA`** — a `[2×4]·[4×2] → [2×2]` matmul-accumulate: `a` holds a **2×4
+  row-major** tile, `b` a **4×2 column-major** tile. **16 MACs/instr**, twice BFDOT's
+  rate — but it is only full-rate given ≥2 independent rows on *both* operands, and
+  it **dictates the operand layout**, so both inputs must be pre-packed into its tile
+  shape.
 
-BFMMLA appears only in `attn.c` and `sanity.c`. `flash.c` dropped its BFMMLA path
-(and its `use_mmla` flag) when it moved to SVE, and uses the VL-agnostic
-`svbfdot_f32` for everything — see below.
+`flash.c` takes BFDOT. The consequence is the whole reason the kernel packs almost
+nothing: because BFDOT constrains no layout, the contraction axes alone decide what
+must be packed — and they say **Q and K need no pack at all** (see *Why only V is
+packed*). BFMMLA's 2× MAC rate would have to pay for a Q pack, a K pack, and, at
+decode (`Sq=1`), a padded 2-row query tile whose second row is pure waste — the
+concrete "50% double-compute" cost of forcing a GEMM instruction onto a GEMV shape.
 
-## Kernel design (`attn.c`, NEON)
+## Flash-attention kernel (`flash.c`) — SVE-only, BFDOT
+
+A *materialising* attention kernel keeps the full `[Sq×Sk]` score matrix — `Sq*Sk*4`
+bytes, i.e. 4 / 16 / **64** MB per head at 1k / 2k / 4k — which blows past cache at
+long context. `flash.c` blocks over keys with **online softmax** so `S` is never
+materialised, which is the right shape for 1k–4k prefill.
 
 **One kernel handles MHA and GQA.** The only difference is the head→kv mapping
 `kv = h / group`, `group = num_q_heads / num_kv_heads`:
@@ -91,96 +107,25 @@ BFMMLA appears only in `attn.c` and `sanity.c`. `flash.c` dropped its BFMMLA pat
 - GQA: `num_kv_heads  < num_q_heads` → `group  > 1`
 - MQA: `num_kv_heads == 1`
 
-(`flash.c` uses the identical mapping.)
-
-Per head it does `S = scale · Q·Kᵀ` → mask (causal optional) → softmax (fp32) →
-`O = P·V`. Two selectable compute paths:
-
-- **BFDOT path** — every score `S[i,j]` and every output `O[i,d]` is a bf16
-  dot-product reduction. Works for any shape, including decode `Sq=1`.
-  `V` is transposed to `Vᵀ` so the `P·V` contraction is contiguous.
-- **BFMMLA path** — `Q·Kᵀ` is tiled as **query-pair × key-pair** (contract over
-  `head_dim` in steps of 4); `P·V` as **query-pair × dim-pair** (contract over
-  keys). Odd `Sq`/`Sk`/`D` are handled by **zero-padding** the packed buffers, and
-  padded key columns are masked to `-inf` so they don't leak into softmax.
-
 bf16 tensors are stored as `uint16_t` bit patterns (the top 16 bits of fp32) and
 reinterpreted as `bfloat16_t`, so the **exact same bits** feed the hardware kernel
 and the fp32 reference — the only divergence is bf16 rounding of the softmax
 probabilities `P` and fp32 accumulation order.
 
-> Note on decode: with `Sq=1`, the BFMMLA path pads the query tile to 2 rows, so
-> its second row is wasted — this is the concrete "50% / double-compute" cost of
-> forcing BFMMLA onto a single-query MHA/GQA decode step. See *Enhancements*.
-> (`flash.c` is BFDOT-only and has no such waste.)
-
-## Verification results — `attn.c` (QEMU 8.2.2, `-cpu max`)
-
-```
-MHA prefill            grp1 Sq=8 Sk= 8 D= 64 full   err/scale: BFDOT=1.8e-03 BFMMLA=1.8e-03  dot-vs-mmla=6e-08  PASS
-MHA prefill causal     grp1 Sq=8 Sk= 8 D= 64 causal err/scale: BFDOT=1.6e-03 BFMMLA=1.6e-03  dot-vs-mmla=6e-08  PASS
-GQA prefill            grp4 Sq=8 Sk= 8 D= 64 full   err/scale: BFDOT=2.0e-03 BFMMLA=2.0e-03  dot-vs-mmla=6e-08  PASS
-GQA prefill causal     grp4 Sq=8 Sk= 8 D= 64 causal err/scale: BFDOT=2.5e-03 BFMMLA=2.5e-03  dot-vs-mmla=6e-08  PASS
-MHA decode(Sq=1)       grp1 Sq=1 Sk=16 D= 64 full   err/scale: BFDOT=1.8e-03 BFMMLA=1.8e-03  dot-vs-mmla=3e-08  PASS
-GQA decode(Sq=1)       grp4 Sq=1 Sk=16 D= 64 full   err/scale: BFDOT=2.5e-03 BFMMLA=2.5e-03  dot-vs-mmla=1e-08  PASS
-MQA prefill            grp8 Sq=8 Sk= 8 D= 64 full   err/scale: BFDOT=2.1e-03 BFMMLA=2.1e-03  dot-vs-mmla=3e-08  PASS
-GQA odd shapes         grp2 Sq=5 Sk= 7 D= 40 causal err/scale: BFDOT=2.1e-03 BFMMLA=2.1e-03  dot-vs-mmla=0      PASS
-GQA big head_dim       grp4 Sq=4 Sk=12 D=128 full   err/scale: BFDOT=2.0e-03 BFMMLA=2.0e-03  dot-vs-mmla=3e-08  PASS
-=== ALL PASS ===
-```
-
-- `err/scale` = max |kernel − fp32ref| normalised by output signal scale.
-  ~`2e-3` matches the ~0.4% bf16 mantissa rounding of `P`.
-- `dot-vs-mmla` ~`1e-8` ⇒ BFDOT and BFMMLA agree to floating-point noise (both do
-  exact bf16 products with fp32 accumulation).
-- Pass criterion **for `attn.c`**: `|kernel − ref| ≤ 2e-2 + 2e-2·|ref|` for every
-  element. `flash.c` no longer uses this bound — it was measured to be ~30× looser
-  than the real bf16 noise; see *Tolerance* below.
-
-### Long-sequence prefill (`./attn --long`, D=128, causal)
-
-```
-prefill 1k MHA   Sq=1024 Sk=1024 D=128  err/scale=1.9e-3  0.54 GFLOP  PASS
-prefill 1k GQA   Sq=1024 Sk=1024 D=128  err/scale=1.9e-3  2.15 GFLOP  PASS   (4 q-heads / 1 kv)
-prefill 2k MHA   Sq=2048 Sk=2048 D=128  err/scale=1.9e-3  2.15 GFLOP  PASS
-prefill 4k MHA   Sq=4096 Sk=4096 D=128  err/scale=1.3e-3  8.59 GFLOP  PASS
-```
-
-Accuracy holds at 4k (softmax over 4096 keys stays stable via max-subtraction).
-The `--long` cases reference-check only a subset of query rows (the scalar fp32
-reference is O(Sq*Sk*D) and slow under emulation) but cross-check BFDOT vs BFMMLA
-on **every** row. QEMU timings are functional-emulation only (~0.1 GFLOP/s), not
-representative of hardware.
-
-> `attn.c`'s subset is a **prefix** of query rows. For causal `Sq==Sk` that is
-> weak coverage for the same reason it was in `flash.c` — see *Reference rows*
-> below. `flash.c` was fixed; `attn.c` was not.
-
-**Memory note for 1k-4k prefill:** this kernel *materializes* the score matrix
-`S` (Sq*Sk*4 bytes = 4 / 16 / **64** MB at 1k / 2k / 4k per head). Fine for
-verification, but it blows past cache at 4k, so a production kernel should use
-flash-attention-style key-blocking with online softmax (memory O(Sq*D)), keeping
-the `S`/`P` tiles resident. See below.
-
-## Flash-attention kernel (`flash.c`) — SVE-only, BFDOT
-
-The materialising kernel above keeps the full `S` matrix (64 MB/head at 4k).
-`flash.c` is the version you'd actually ship for 1k–4k prefill: it blocks over
-keys with **online softmax** so `S` is never materialised.
-
 It is **SVE only** — `arm_sve.h` is the sole ARM header, no NEON, no SME/ZA — and
 `svbfdot_f32` is the single compute primitive for **both** `Q·Kᵀ` and `P·V`.
 
-Per query-block (`BQ=64`) it keeps only running state — max `m[Bq]`, denominator
-`l[Bq]`, output accumulator `acc[Bq×D]`. Each key-block (`BK=64`):
+Per query-block (`BQ=64`, compile-time) it keeps only running state — max `m[Bq]`,
+denominator `l[Bq]`, output accumulator `acc[Bq×D]`. Each key-block (`bk`, a **runtime**
+argument, default 128 — see *Tuning `bk`*):
 
 1. `S = scale · Q_blk·K_blkᵀ`  (BFDOT, block-local)
 2. per row: `m_new = max(m, rowmax S)`, `α = exp(m−m_new)`, `P = exp(S−m_new)`
 3. `l ← α·l + rowsum(P)`,  `acc ← α·acc + P·V_blk`  (BFDOT again)
 
 Final `O = acc / l`. Causal key-blocks wholly in the future are skipped (and end
-the k-loop). **Memory is O(Bq·D + Bq·Bk)** (a few tens of KB/head) regardless of
-sequence length — the right shape for long-context prefill.
+the k-loop). **Memory is O(Bq·D + Bq·Bk)** (~50–180 KB/head over `D`=1..256; see the
+table below) regardless of sequence length — the right shape for long-context prefill.
 
 ### Allocation-free: the caller owns the scratch
 
@@ -190,19 +135,39 @@ cannot fail for want of memory, and works under an arena/bump allocator or a
 no-malloc-in-the-hot-path policy. The caller passes one scratch block:
 
 ```c
-/* Bytes of scratch attn_flash() needs for this head_dim. */
-size_t attn_flash_scratch_bytes(int D);
+/* Largest power-of-2 bk whose per-key-block cache footprint double-buffers into
+ * l2_bytes. An ANALYTICAL model, not a measurement — see "Tuning bk" below. */
+int    attn_flash_pick_bk(int D, size_t l2_bytes);
 
-/* scratch: caller-owned, >= attn_flash_scratch_bytes(D) bytes, suitably aligned. */
+/* Scratch bytes for this head_dim AND key-block size. */
+size_t attn_flash_scratch_bytes(int D, int bk);
+
+/* bk: power of two in [ATTN_BK_MIN, ATTN_BK_MAX] = [16, 4096].
+ * scratch: caller-owned, >= attn_flash_scratch_bytes(D, bk), ATTN_SCRATCH_ALIGN-aligned. */
 static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, float *O,
-                       int Hq, int Hkv, int Sq, int Sk, int D, int causal, void *scratch);
+                       int Hq, int Hkv, int Sq, int Sk, int D, int causal, int bk,
+                       void *scratch);
 ```
 
-**The size depends only on `D` — never on `Sq`/`Sk`.** That is not a convenience, it
-*is* the O(Bq·D + Bq·Bk) property above: `BQ`/`BK` are compile-time constants, so a
-driver allocates **one block per thread at start-up and reuses it for every sequence
-length** — 1-token decode and 4k prefill alike — and frees it at shutdown. The kernel
-keeps no state across calls; it initialises everything it reads.
+**The size depends only on `D` and `bk` — never on `Sq`/`Sk`.** That is not a
+convenience, it *is* the O(Bq·D + Bq·bk) property above, so a driver allocates **one
+block per thread at start-up and reuses it for every sequence length** — 1-token decode
+and 4k prefill alike — and frees it at shutdown. The kernel keeps no state across calls;
+it initialises everything it reads.
+
+**`bk` is validated, loudly.** A power of two in `[16, 4096]`; anything else — including
+`0` and negatives — prints the contract to `stderr` and `abort()`s, at *both* doors
+(`attn_flash` and `attn_flash_scratch_bytes`). This is not pedantry: `bk` is
+simultaneously the k-loop step **and** the `Vt`/`Pb`/`S` row stride, so a `bk` the caller
+did not also use to *size* the block mis-strides every tile and runs off the end —
+numerically invisible, exactly the silent heap overflow the single-source-of-truth layout
+exists to prevent. The power-of-two rule is a **contract requirement, not an
+implementation need**: every loop is `whilelt`-predicated and would take `bk=100` happily.
+It is enforced anyway so a tuning loop cannot wander onto a value the contract does not
+cover. The bounds' rationale: `16` is `svcnth()` on the 256-bit target (one whole bf16
+vector — below it the `bfdot`/`svaddv` ratio that *motivates* `bk` drops under 1), and
+`4096` is where `S[BQ×bk]` alone reaches 1 MiB and the O(Bq·bk) memory property has
+stopped meaning anything.
 
 **Alignment is a contract, not a nicety.** The block must be aligned to
 `ATTN_SCRATCH_ALIGN` (**64 bytes**, a cache line). The carve mixes `uint16_t` and
@@ -212,45 +177,134 @@ SVE loads never straddle a line. Use `aligned_alloc` / `posix_memalign`, not pla
 `malloc`. The returned size already includes that padding *and* is itself rounded up
 to 64, so it is a legal C11 `aligned_alloc` size.
 
-Driver usage — this is exactly what `run_case()` does:
+Driver usage — a **fixed** `bk`, which is what `run_case()` does:
 
 ```c
-size_t sbytes  = attn_flash_scratch_bytes(D);       /* depends on D only */
+int    bk      = attn_flash_pick_bk(D, 1u << 20);   /* or your own tuned value */
+size_t sbytes  = attn_flash_scratch_bytes(D, bk);   /* depends on D and bk only */
 void  *scratch = aligned_alloc(ATTN_SCRATCH_ALIGN, sbytes);   /* once, per thread */
 
 for (each request) /* any Sq, any Sk, any causal — same block */
-    attn_flash(Q, K, V, O, Hq, Hkv, Sq, Sk, D, causal, scratch);
+    attn_flash(Q, K, V, O, Hq, Hkv, Sq, Sk, D, causal, bk, scratch);
 
 free(scratch);                                      /* at shutdown */
 ```
 
-**One source of truth.** `attn_flash_layout(base, D, s)` both measures (`base == NULL`)
-and carves; `attn_flash_scratch_bytes()` is literally its measuring pass, and
-`attn_flash()` calls it to carve. The size query and the carve therefore cannot drift
-apart — a hand-written size sum kept beside a separate carve is how you get a silent
-heap overflow. Do not add a second copy of those sizes.
+#### A driver that **sweeps** `bk` must size for the LARGEST `bk` it will try
 
-Sizes are small and grow linearly in `D` (measured, `BQ=BK=64`):
+This is the one obligation runtime `bk` adds, and getting it wrong is a silent heap
+overflow. Three of the eight sub-buffers (`Vt`, `Pb`, `S`) scale with `bk`, so a block
+cut for `bk=64` handed to a `bk=512` call scribbles past the end — and nothing in the
+carve re-checks the caller's size. **Size once, for the max, then reuse that one block:**
 
-| `D` | 1 | 40 | 64 | 128 | 256 |
+```c
+static const int bks[] = {64, 128, 256, 512, 1024};
+int bk_max = bks[sizeof bks / sizeof bks[0] - 1];             /* the LARGEST, not the first */
+
+size_t sbytes  = attn_flash_scratch_bytes(D, bk_max);         /* ONE allocation ... */
+void  *scratch = aligned_alloc(ATTN_SCRATCH_ALIGN, sbytes);
+
+for (size_t i = 0; i < sizeof bks / sizeof bks[0]; i++)       /* ... reused for every bk */
+    attn_flash(Q, K, V, O, Hq, Hkv, Sq, Sk, D, causal, bks[i], scratch);
+
+free(scratch);
+```
+
+A larger-than-needed block is always safe: `scratch_bytes` is monotone non-decreasing in
+`bk` (checked over `D`=1…1024 × `bk`=16…4096) and the carve is a prefix, so a smaller
+`bk` simply uses less of it. `sweep_bk()` in `flash.c` (`./flash --sweep-bk`) is this
+pattern, verbatim.
+
+Both halves of that rule are **tested, not just asserted** (`Hq=4/Hkv=2, Sq=130, Sk=300,
+D=128, causal`, one block, canary verified after *every* call, `bk` ascending **and**
+descending):
+
+| | result |
+|---|---|
+| size for the **largest** `bk`, reuse for all (the rule) | **10/10 PASS, 0 canary breaches**, `err/scale` 1.5e-3…1.6e-3 across 10→1 key blocks |
+| size for the **smallest** `bk`, reuse for all (the bug) | **SIGSEGV** |
+
+Note *how* the bug failed: at `D=128` the block would be 54 528 B while `bk=512` needs
+361 728 — a 300 KB overrun, far past any canary and off the end of the heap, so it
+segfaulted rather than corrupting quietly. A smaller mismatch would not be so kind; it
+would just silently scribble. Hence the rule.
+
+**One source of truth.** `attn_flash_layout(base, D, bk, s)` both measures
+(`base == NULL`) and carves; `attn_flash_scratch_bytes()` is literally its measuring
+pass, and `attn_flash()` calls it to carve. The size query and the carve therefore
+cannot drift apart — a hand-written size sum kept beside a separate carve is how you get
+a silent heap overflow. Do not add a second copy of those sizes. Making `bk` runtime does
+not weaken this: `bk` is a *parameter* of the one layout function, so measure and carve
+still agree by construction **for a given `bk`** — it is now the caller's job to measure
+with the same `bk` it later passes in.
+
+Sizes grow linearly in `D` and in `bk` (measured, `BQ=64`):
+
+| `attn_flash_scratch_bytes(D, bk)` | `D`=1 | 40 | 64 | 128 | 256 |
 |---|---|---|---|---|---|
-| `attn_flash_scratch_bytes(D)` | 25 792 | 40 896 | 50 176 | 75 008 | 124 672 |
+| `bk`=32 | 13 440 | 26 048 | 33 792 | 54 528 | 96 000 |
+| `bk`=64 | 25 792 | 40 896 | 50 176 | 75 008 | 124 672 |
+| **`bk`=128** *(default)* | **50 496** | **70 592** | **82 944** | **115 968** | **182 016** |
+| `bk`=256 | 99 904 | 129 984 | 148 480 | 197 888 | 296 704 |
+| `bk`=512 | 198 720 | 248 768 | 279 552 | 361 728 | 526 080 |
 
-Alignment padding costs ≤ 60 bytes total (worst case `D=1`, 0.23%); at `D`=64/128/256
-every extent is already a multiple of 64 and the padding is exactly **0**. Verified for
-`D` ∈ {1, 3, 7, 8, 33, 40, 64, 65, 128, 256}: all 8 sub-buffers in bounds, 64-byte
-aligned, pairwise non-overlapping, and the reported size equals the carve's high-water
-mark exactly (zero slack). Note the shipped 9 cases only use `D`=40/64/128 (padding
-32/0/0), so the `D` whose padding *shifts* the carve are swept separately for
-**numerical** correctness — `D` ∈ {1,2,3,7,8,33,40,64,65,127,128,129,256}, two shapes
-each: **26/26 PASS**, `err/scale` bit-identical to the pre-refactor kernel on all 26.
-Verified at runtime over the whole suite with a 256-byte
-canary past the end (**0 breaches**) and with the scratch pre-poisoned to `0xFF`
-(NaN in every lane) before each call — **9/9 PASS, `err/scale` unchanged**, so the
-kernel never reads scratch it did not initialise. Both guards were fault-injected to
-prove they have teeth: a deliberate 1-byte overflow trips 9/9 canaries (while the
-correctness suite still says `ALL PASS` — which is precisely why the canary exists),
-and deleting the `acc` zero-init trips the NaN counter.
+Only the three `bk`-sized tiles move — `Vt[D×bk]`, `Pb[BQ×bk]`, `S[BQ×bk]`; `acc[BQ×D]`,
+`pv[D]` and `m`/`l`/`al[BQ]` are constant in `bk`. Ignoring alignment padding the whole
+carve is
+
+```
+scratch_bytes(D, bk) = 2·bk·(D + 3·BQ)  +  (4·BQ·D + 4·D + 12·BQ)
+                       \___bk-dep____/     \________fixed_______/
+```
+
+which reproduces every column above exactly (only `D=1` differs, by the ≤60 B of padding).
+So each doubling of `bk` costs `2·bk·(D+3·BQ)` more: at `D=128`, 64→128 is `+16 KiB`
+(`Vt`) `+8 KiB` (`Pb`) `+16 KiB` (`S`) = **exactly +40 KiB**, 75 008 → **115 968 B**.
+
+> Note this is **not** `attn_flash_pick_bk`'s formula, and the two are not meant to
+> agree — see *Tuning `bk`* below. This one counts the scratch the kernel actually
+> allocates; that one counts a cache footprint including streamed `K`/`V`/`Q` blocks
+> that are never copied into scratch at all.
+
+> **Analytical note, not a measurement.** At `D=128` the scratch crosses a 64 KiB L1D
+> between `bk=32` and `bk=64`:
+>
+> | `bk` at `D=128` | 16 | 32 | 64 | 128 | 256 |
+> |---|---|---|---|---|---|
+> | scratch | 43.25 KiB | 53.25 KiB | 73.25 KiB | 113.25 KiB | 193.25 KiB |
+> | fits 64 KiB L1D? | yes | yes | **no** | **no** | **no** |
+>
+> So the shipped default (`bk=128`) does not fit an L1D, and neither did the old `BK=64`
+> — that line was already crossed before `bk` became tunable. And this is scratch
+> *alone*, before the streamed K/V/Q blocks. This is why `pick_bk` targets **L2, not
+> L1D**: at any `bk` big enough to be worth using, L1D residency is not on the table, so
+> the interesting question is whether the working set stays in L2. All arithmetic:
+> **QEMU models no cache**, so nothing in this repo measures the consequence, and no
+> performance claim either way is made from it.
+
+Alignment padding costs ≤ 60 bytes total (worst case `D=1`, 0.12%); at `D`=64/128/256
+every extent is already a multiple of 64 and the padding is exactly **0**.
+
+**Re-verified for runtime `bk`** over `D` ∈ {1,2,3,7,8,33,40,63,64,65,127,128,129,256} ×
+`bk` ∈ {32,64,128,256,512} — **70/70 OK**: all 8 sub-buffers in bounds, 64-byte aligned,
+pairwise non-overlapping, measure == carve, and the reported size equals the carve's
+high-water mark exactly (**zero slack at every (D, bk)**). Each of the 70 also ran a real
+`attn_flash` call (`Hq=6/Hkv=3, Sq=130, Sk=70, causal` — 3 query blocks, `Sk<Sq`) with the
+scratch **pre-poisoned to `0xFF`** (NaN in every f32/bf16 lane) and a **256-byte `0x5A`
+canary** past the declared size: **70/70 PASS, 0 breaches**, and `err/scale` is
+**bk-invariant per D** (e.g. 1.0e-3 at `D=1` and 1.4e-3 at `D=256` at *all five* `bk`).
+
+Both guards were **fault-injected to prove they have teeth**:
+
+| injected fault | canary | NaN-poison counter | suite verdict |
+|---|---|---|---|
+| 1-byte write at `scratch_bytes(D,bk)` | **70/70 BREACH** | quiet | still `err/scale=1.4e-3` — *numerically invisible* |
+| `acc` zero-init deleted | quiet | **70/70 caught** (`nbad=780`) | `*** FAIL (non-finite) ***` |
+| `acc` zero-init deleted **and poison disabled** | quiet | quiet | **ALL OK** ← the negative control |
+
+The first row is the entire reason the canary exists: a heap overflow does not move the
+numbers. The third is the control that proves it is the *poison* catching the second row
+and not some unrelated check.
 
 ### Why only V is packed
 
@@ -270,10 +324,164 @@ The price of an unpacked K, accepted deliberately: BFDOT cannot use the
 `svbfdot_lane` outer-product form, so every score ends in one `svaddv` horizontal
 reduction. `UNR=4` independent accumulators per pass overlap that latency.
 
+**And that price is what makes `bk` worth tuning.** With no packed K, each score/output
+element ends in exactly one `svaddv`, so the useful ratio is
+
+```
+bfdots per svaddv = (contraction length) / svcnth()
+```
+
+`P·V` contracts over **`bk`** — so `bk` *is* that contraction length. Targeting
+**256-bit SVE** (Neoverse V1 / Graviton3 class), `svcnth()` = 16, giving
+
+| `bk` | bfdot per `svaddv` at VL=256 |
+|---|---|
+| 64 | 4 |
+| **128** | **8** |
+| 256 | 16 |
+
+`BQ` does not enter the ratio — it contracts over `D`, not `bk` — so it stays a
+compile-time **64**.
+
+### Tuning `bk` — it is a **runtime** parameter
+
+`bk` is the one knob whose best value is a property of the **machine**, not of the code:
+it trades against `svcnth()` (a runtime VL) and against L2 residency (a per-part cache
+size). Neither is knowable at compile time, so `bk` is an **argument to `attn_flash()`**
+and a driver retunes it per deployment **without rebuilding**. `BQ` stays compile-time
+for exactly the inverse reason.
+
+Correctness is independent of `bk`: every extent is a real extent and every tail is
+predicated. Verified **9/9 × `bk` ∈ {32,64,128,256,512} × VL ∈ {128,256,512,1024,2048}
+= 25/25 ALL PASS**, plus a multi-key-block shape (`Sk=1024`, i.e. 32 → 1 key blocks) at
+**6 `bk` × 5 VL = 30/30 PASS**, `err/scale` 1.4e-3…1.7e-3 throughout.
+
+#### `attn_flash_pick_bk(D, l2_bytes)` — the sizing model
+
+**Criterion: the whole per-key-block working set, double-buffered, must fit in L2** —
+`2 · working_set(D, bk) ≤ l2_bytes` — take the largest power-of-2 `bk` satisfying it. The
+×2 is the double-buffering allowance: while the loop computes on key-block `kj`, the next
+block's K/V are expected to be arriving, so budget two of everything.
+
+The working set counts **both** the scratch **and the streamed tensor blocks the loop
+touches**. K/V/Q are read straight from the caller's tensors — no pack buffer — but they
+still occupy cache, so a scratch-only budget would understate the `bk`-dependent term and
+pick a `bk` that thrashes. The streamed K+V blocks alone are `4·D·bk` of the `6·bk·(D+BQ)`
+term — **44% at `D=128`**, rising toward ⅔ as `D` grows (33% at `D`=64, 53% at `D`=256):
+
+| term | bytes | `bk`-dependent? |
+|---|---|---|
+| `Vt` packed Vᵀ (scratch) | `2·D·bk` | yes |
+| `Pb` probs bf16 (scratch) | `2·BQ·bk` | yes |
+| `S` scores fp32 (scratch) | `4·BQ·bk` | yes |
+| K block (streamed in place) | `2·D·bk` | yes |
+| V block (streamed in place) | `2·D·bk` | yes |
+| `acc` (scratch) | `4·BQ·D` | no |
+| Q block (streamed in place) | `2·BQ·D` | no |
+| `pv` (scratch) | `4·D` | no |
+| `m`,`l`,`al` (scratch) | `12·BQ` | no |
+
+```
+working_set(D, bk) = 6·bk·(D + BQ)  +  (6·BQ·D + 4·D + 12·BQ)
+                     \__bk-dep____/     \________fixed_______/
+```
+
+Worked example — `D=128`, `BQ=64`, `l2` = 1 MiB:
+
+```
+bk-dep = 6·(128+64) = 1152 B per unit of bk      fixed = 6·64·128 + 4·128 + 12·64 = 50 432 B
+2·(1152·bk + 50 432) ≤ 1 048 576  →  bk ≤ 411.3  →  largest power of two = 256
+```
+
+`./flash --check-pick-bk` reproduces this numerically and asserts that `512` would violate
+the bound (**PICK_BK OK, 0 checks failed**). What it picks:
+
+| | 1 MiB L2 | 2 MiB | 4 MiB | 8 MiB |
+|---|---|---|---|---|
+| `pick_bk(128, ·)` | **256** | 512 | 1024 | 2048 |
+
+| | `D`=64 | 128 | 256 | 512 |
+|---|---|---|---|---|
+| `pick_bk(·, 1 MiB)` | 512 | **256** | 128 | 64 |
+
+#### `pick_bk` and `scratch_bytes` are **not** the same model — deliberately
+
+They answer different questions and **will not agree**. Do not derive one from the other:
+
+- **`scratch_bytes(D, bk)`** — the **exact allocation** the kernel needs. Scratch
+  sub-buffers only, plus 64 B inter-buffer padding. **Size with this one, always.**
+- **`pick_bk(D, l2)`** — a **cache-footprint heuristic**. Counts streamed K/V/Q blocks
+  that are never allocated here at all. It is an **analytical model, not a measurement**.
+
+#### To change the model
+
+Edit **only `attn_flash_pick_bk()`** — the formula is two lines and nothing else in the
+kernel reads them. A different L2? Pass a different `l2_bytes` (it is the caller's number,
+not baked in). Driver pre-packs K/V elsewhere? Drop their `4·D·bk` from `per_bk`. Single-
+buffering? Change the `2` in the bound.
+
+Edge cases, all deliberate and tested by `--check-pick-bk`: the working set is monotone in
+`bk`, so the first failing `bk` ends the scan; if even `ATTN_BK_MIN` busts the bound (tiny
+L2, huge `D`) it returns **`ATTN_BK_MIN`** — never `0`, which no caller could use, and
+never a loop that cannot terminate; the result is always a power of two in `[16, 4096]`;
+`l2_bytes` = `0` yields the floor and `SIZE_MAX` the cap; `D<1` is clamped, not trusted.
+
+> **A bug found here by review, and worth the warning.** `pick_bk` originally wrote
+> `(size_t)(D + BQ)`, which computes `D + BQ` in **`int`** and only then widens — signed
+> overflow (UB) for `D ≥ INT_MAX−64`. It did not just trip a sanitizer: the wrap made the
+> per-`bk` coefficient negative, **inverting the bound test**, so `pick_bk` returned a
+> *too-large* `bk` (`pick_bk(INT_MAX, 2e12)` → 64 where the model says 16). Fixed by
+> widening before the add; now verified against an exact 128-bit model over
+> `D` ∈ {1…INT_MAX} × `l2` ∈ {0…SIZE_MAX} — **60 combos, 0 mismatches**. If you edit the
+> formula, keep every `D` cast to `size_t` *before* it enters an arithmetic expression.
+
+**Known gap (pre-existing, not fixed):** `attn_flash_scratch_bytes` and the carve do
+**not** validate `D`. `attn_flash_scratch_bytes(-1, 128)` returns a plausible-looking
+49 408 while the carve places sub-buffers *below* the block — silent corruption. `bk` is
+validated; `D` is not. This predates the runtime-`bk` change (`(size_t)D * BK * 2` wrapped
+identically) and is left as a deliberate follow-up decision, since adding a `D` contract
+would change the semantics of a shipped size query.
+
+#### `./flash --sweep-bk` — the tuning tool
+
+Runs one fixed shape across `bk` = 32…1024 and reports correctness + timing per `bk`,
+**from one binary, no rebuild**. It is also the reference *size-for-the-largest-`bk`*
+driver pattern.
+
+> ### ⚠ QEMU cannot validate `bk`, and this repo therefore does not
+>
+> `pick_bk`'s entire rationale is **cache residency**. QEMU is a **functional emulator**:
+> **no cache model, no memory latency, no pipeline**, and this build has **no TCG
+> plugin**. Its wall-clock is at best a proxy for **instructions executed**. So **nothing
+> in this repo is evidence that one `bk` beats another on silicon**, and no such claim is
+> made anywhere in it. `--sweep-bk` is built to be run **on real hardware** (Neoverse V1 /
+> Graviton3 class, 1 MiB L2). Under QEMU, read the PASS column only. The sweep prints this
+> caveat in its own output header.
+
+QEMU sweep at VL=512 (`Hq=4/Hkv=2, Sq=128, Sk=1024, D=128`, non-causal) —
+**an instruction-count observation only, NOT a hardware result**:
+
+| `bk` | key blocks | scratch B | `err/scale` | QEMU s |
+|---|---|---|---|---|
+| 32 | 32 | 54 528 | 1.5e-03 | 3.64 |
+| 64 | 16 | 75 008 | 1.4e-03 | 3.59 |
+| 128 | 8 | 115 968 | 1.5e-03 | 3.67 |
+| 256 | 4 | 197 888 | 1.5e-03 | 3.70 |
+| 512 | 2 | 361 728 | 1.7e-03 | 3.56 |
+| 1024 | 1 | 689 408 | 1.5e-03 | 3.47 |
+
+All PASS. The times span ~6% with **no interpretable trend** — which is the expected
+result, not a disappointment: the shape does identical arithmetic at every `bk` (that is
+why the sweep shape is **non-causal** — under a causal mask the block-skip granularity is
+`bk` itself, so total work would change with `bk` and confound the timing), and the one
+effect `bk` is *supposed* to have is invisible to an emulator with no cache. **The
+cache-driven part of `pick_bk` is unmeasurable here. Full stop.**
+
 ### Predication replaced all padding
 
-The NEON code zero-pads its tiles (`Bqp` even, `Bkp`/`Dp` multiple of 8) and
-`-inf`-masks the padded key columns. SVE needs none of it:
+A NEON/BFMMLA design must zero-pad its tiles (query rows to a multiple of 2, key and
+dim extents to a multiple of 8 — the tile shapes BFMMLA dictates) and `-inf`-mask the
+padded key columns so they cannot leak into softmax. SVE needs none of it:
 
 - **D-tail:** a `svwhilelt_b16` *zeroing* load makes BFDOT's pair lanes contribute
   0 to the dot. A short row costs nothing and needs no padded buffer.
@@ -296,33 +504,58 @@ scalar code lives only in the fp32 reference and the harness.
 Every loop is driven by `svcntw()` / `svcnth()` / `svwhilelt` at runtime; nothing
 is hardcoded to a vector width. Verified 9/9 PASS at **VL = 128 / 256 / 512 /
 1024 / 2048** (`qemu -cpu max,sve<N>=on,sve-default-vector-length=-1`), each
-reporting the expected lane counts, worst `err/scale` = 1.7e-3 at *every* width.
-VL=2048 is the strong case: `svcnth()`=128 exceeds `BK`=64 — exactly what a
-padded design would break on.
+reporting the expected lane counts, worst `err/scale` = 1.7e-3 at *every* width —
+byte-for-byte the same nine values at all five widths.
+
+VL=2048 remains the strong case at the default `bk=128`: `svcnth()`=128 means a **whole
+key block is one predicated vector** (and it still exceeds the shipped `D`=64), so the
+`P·V` k-loop runs a single, fully-predicated iteration. A padded design would break here;
+this one needs no padding because the `whilelt` bound *is* the block extent. Runtime `bk`
+widens this: at VL=2048, `bk` ∈ {32,64} makes the k-loop a *partly-masked* single vector
+(`bk` < `svcnth()`), which is the `ATTN_BK_MIN` rationale made concrete — still correct
+(verified 9/9 at every combination), just wasteful of lanes.
 
 ### Verification (`./flash`)
 
 ```
 === FLASH bf16 attention (online softmax, SVE BFDOT vs fp32 ref) ===
 SVE VL: svcntw()=16 f32 lanes, svcnth()=32 bf16 lanes (runtime, not hardcoded)
-MHA prefill       H= 4/4 (g1) Sq=8    Sk=8    D= 64 full   | err/scale=1.4e-03 |    0.00 GFLOP    0.00s  0.02 GFLOP/s -> PASS
-MHA prefil.causal H= 4/4 (g1) Sq=8    Sk=8    D= 64 causal | err/scale=9.4e-04 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
-GQA prefill       H= 8/2 (g4) Sq=8    Sk=8    D= 64 full   | err/scale=1.5e-03 |    0.00 GFLOP    0.00s  0.04 GFLOP/s -> PASS
-GQA prefil.causal H= 8/2 (g4) Sq=8    Sk=8    D= 64 causal | err/scale=1.3e-03 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
-MHA decode(Sq=1)  H= 4/4 (g1) Sq=1    Sk=16   D= 64 full   | err/scale=1.1e-03 |    0.00 GFLOP    0.00s  0.04 GFLOP/s -> PASS
-GQA decode(Sq=1)  H= 8/2 (g4) Sq=1    Sk=16   D= 64 full   | err/scale=1.7e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
-MQA prefill       H= 8/1 (g8) Sq=8    Sk=8    D= 64 full   | err/scale=1.6e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
-odd + multiblock  H= 6/3 (g2) Sq=130  Sk=70   D= 40 causal | err/scale=1.3e-03 |    0.00 GFLOP    0.11s  0.02 GFLOP/s -> PASS
-GQA big head_dim  H= 8/2 (g4) Sq=4    Sk=12   D=128 full   | err/scale=1.5e-03 |    0.00 GFLOP    0.01s  0.04 GFLOP/s -> PASS
+bk=128 (RUNTIME, --bk N to change; scratch 115968 B at D=128). pick_bk(128, 1 MiB L2)=256
+MHA prefill       H= 4/4 (g1) Sq=8    Sk=8    D= 64 bk=128  full   | err/scale=1.4e-03 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
+MHA prefil.causal H= 4/4 (g1) Sq=8    Sk=8    D= 64 bk=128  causal | err/scale=9.4e-04 |    0.00 GFLOP    0.00s  0.03 GFLOP/s -> PASS
+GQA prefill       H= 8/2 (g4) Sq=8    Sk=8    D= 64 bk=128  full   | err/scale=1.5e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
+GQA prefil.causal H= 8/2 (g4) Sq=8    Sk=8    D= 64 bk=128  causal | err/scale=1.3e-03 |    0.00 GFLOP    0.00s  0.02 GFLOP/s -> PASS
+MHA decode(Sq=1)  H= 4/4 (g1) Sq=1    Sk=16   D= 64 bk=128  full   | err/scale=1.1e-03 |    0.00 GFLOP    0.00s  0.04 GFLOP/s -> PASS
+GQA decode(Sq=1)  H= 8/2 (g4) Sq=1    Sk=16   D= 64 bk=128  full   | err/scale=1.7e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
+MQA prefill       H= 8/1 (g8) Sq=8    Sk=8    D= 64 bk=128  full   | err/scale=1.6e-03 |    0.00 GFLOP    0.00s  0.04 GFLOP/s -> PASS
+odd + multiblock  H= 6/3 (g2) Sq=130  Sk=70   D= 40 bk=128  causal | err/scale=1.3e-03 |    0.00 GFLOP    0.12s  0.02 GFLOP/s -> PASS
+GQA big head_dim  H= 8/2 (g4) Sq=4    Sk=12   D=128 bk=128  full   | err/scale=1.5e-03 |    0.00 GFLOP    0.00s  0.05 GFLOP/s -> PASS
 === ALL PASS ===
 ```
 
-9/9 PASS in ~0.2 s, worst `err/scale` = 1.7e-3. `odd + multiblock`
-(`Sq=130, Sk=70`) spans >1 query block and >1 key block, exercising the
-cross-block rescale — and since the NaN fix (*Known limits* 2) all **780** of its
-rows are genuinely compared, where 360 of them used to pass vacuously. Beyond the shipped suite, 13 extra stress shapes (odd
-`D` = 1/3/7/33/65, block edges `Sq`/`Sk` = 63/64/65, `Sq=1`, `Sk<Sq` causal, MQA
-g16) × 3 VLs = 39 combos all PASS.
+9/9 PASS in ~0.2 s, worst `err/scale` = 1.7e-3. `./flash --bk N` reruns the same suite at
+any legal `bk`, no rebuild: **25/25 ALL PASS** over `bk` ∈ {32,64,128,256,512} × VL ∈
+{128,256,512,1024,2048}, with the nine `err/scale` values **identical in all 25**.
+
+> **Read that matrix honestly — it is weaker than it looks.** The shipped suite's `Sk` are
+> 8, 8, 8, 8, 16, 16, 8, **70**, 12 — so for **8 of the 9 cases every `bk` ≥ 32 is a single
+> key block**, and sweeping `bk` re-blocks *nothing*. Only `odd + multiblock` (`Sk=70`)
+> genuinely re-blocks, and only at `bk` ∈ {32,64} (3 and 2 key blocks); at `bk` ≥ 128 it is
+> one partial block. That the 25 runs agree bit-for-bit is therefore mostly a statement
+> that identical work gives identical answers.
+>
+> The real bk-invariance evidence is elsewhere, on shapes where `bk` actually re-blocks:
+> - **`--sweep-bk`** (`Sk=1024` → **32/16/8/4/2/1** key blocks) × 5 VLs = **30/30 PASS**,
+>   `err/scale` 1.4e-3…1.7e-3 — bk-invariant across a 32× change in blocking.
+> - **Tail/boundary probe**: for each `bk`, `Sk` ∈ {1, `bk`−1, `bk`, `bk`+1, 2`bk`,
+>   2`bk`+1, 70} × {causal, full} = **70/70 PASS, 0 canary breaches**, worst `err/scale`
+>   3.1e-3 vs `TOL`=8e-3. This covers `Sk = bk` exactly (no tail at all — where an
+>   off-by-one in a `whilelt` bound hides) and **`bk` > `Sk`** (e.g. `bk=512, Sk=70`), the
+>   pure partial-block path.
+> - **`--long`** — qwen3 1k/2k/4k = 8/16/32 key blocks at `bk=128`.
+>
+> Restoring multi-key-block coverage to the *short* suite would need a case with `Sk > 128`;
+> still deliberately not added, since the shipped case list remains out of scope.
 
 ### Tolerance: `mad ≤ TOL·maxref`, `TOL = 8e-3`
 
@@ -396,21 +629,25 @@ row sits.
 `hidden_size` differs (1024 vs 2048), and that only sizes the QKV projections; it
 never reaches the attention kernel.
 
+At the default `bk=128` (`./flash --long --bk N` reruns it at any other):
+
 | Sq=Sk | useful GFLOP (causal) | QEMU s | `err/scale` | headroom vs TOL | key blocks row `Sq-1` walks | verdict |
 |---|---|---|---|---|---|---|
-| 1024 | 4.30 | 56.70 | 2.9e-04 | 27× | 16 | PASS |
-| 2048 | 17.19 | 216.03 | 2.1e-04 | 38× | 32 | PASS |
-| 4096 | 68.74 | 856.38 | 1.5e-04 | 53× | **64** | PASS |
+| 1024 | 4.30 | 59.07 | 2.9e-04 | 28× | 8 | PASS |
+| 2048 | 17.19 | 229.26 | 1.8e-04 | 44× | 16 | PASS |
+| 4096 | 68.74 | 871.55 | 1.5e-04 | 53× | **32** | PASS |
 
 - **GFLOP is the causal-correct *useful* count** — `4·Hq·D·#{(i,j): j≤i}`, which is
   **exactly half** (ratio 2.000, verified) of the non-causal `4·Hq·Sq·Sk·D` the old
   harness printed.
 - **Timings are QEMU *functional emulation* of one core. They measure work done,
-  NOT ARM hardware speed** — do not read them as ARM perf. Throughput came out at
-  ~0.079 GFLOP/s across all three, and time scales 3.99× / 4.00× per doubling —
-  clean O(S²), i.e. the causal block-skip holds. The benchmark binary was proven
-  identical to a build of the shipped `flash.c`, so the numbers apply to the
-  delivered kernel exactly.
+  NOT ARM hardware speed** — do not read them as ARM perf. Throughput is
+  0.073 / 0.075 / 0.079 GFLOP/s, and **useful GFLOP scales 4.00× / 4.00×** per doubling —
+  clean O(S²), i.e. the causal block-skip holds. Wall-clock scales slightly *sub*-quadratically
+  (3.88× / 3.80×), which is a QEMU/host artifact (per-run fixed overhead amortising, host
+  noise), not a kernel property — and precisely the sort of thing not to read anything
+  into. `flash_long.log` records this run; its header cites the **md5 of the `flash.c` it
+  was generated from**, verified to match the shipped file.
 - **Do not read the low `err/scale` as better accuracy** — it is the dilution
   described under *Known limits*. The absolute error is unchanged; the denominator
   is not.
@@ -480,20 +717,22 @@ standard); it was the *reference* that was wrong.
   vacuous.~~ **Done — see *Known limits* 2.** The reference emits a zero row and the
   comparison is NaN-safe; `odd + multiblock` now checks all 780 rows (was 46%
   vacuous), `err/scale` unchanged at 1.3e-03.
-- **GQA-decode full-rate BFMMLA** — applies to `attn.c` / NEON, *not* the SVE flash
-  kernel: for `Sq=1`, instead of padding the query tile, pack **two query heads of
-  the same group** into the 2×2 tile (they share the KV head). This fills both tile
-  rows with useful work → no 50% waste. MHA (`group=1`) can't do this and falls
-  back to BFDOT.
 - ~~Online/streaming softmax (flash-style) to avoid materialising `S`.~~ **Done — `flash.c`.**
 - ~~Fully vectorise the flash kernel (QK^T, softmax and P·V all in SVE).~~ **Done — `flash.c`.**
 - Keep `P` in fp32 for the `P·V` step to cut the dominant error source — the whole
   ~1e-3 noise floor is `2^-9 · max_j|V[j][d]|` from bf16 `P`.
 - Close the dilution gap: a **per-row bound with a floor tied to the case scale**
   (plain per-row normalisation is degenerate — see *Known limits*).
-- Give `attn.c` the spread-row reference sample too; its `--long` prefix has the
-  same coverage hole `flash.c` just fixed.
-- Cache-blocking / multithreading the flash kernel; tune `BQ`/`BK` per core. The
-  scratch contract is already the right shape for this — the kernel allocates nothing
-  and touches only the caller's block, so per-thread parallelism needs one
-  `attn_flash_scratch_bytes(D)` block per thread and no other change.
+- ~~Make `BK` tunable without a rebuild.~~ **Done** — `bk` is a runtime argument, with
+  `attn_flash_pick_bk()` and `./flash --sweep-bk`. See *Tuning `bk`*.
+- **Run `--sweep-bk` on real hardware and pick `bk` from data.** This is the obvious next
+  step and the one thing this repo *cannot* do: `pick_bk`'s model is analytical and QEMU
+  models no cache, so `bk`'s real optimum is still unmeasured. Needs a Neoverse V1 /
+  Graviton3-class part.
+- Multithreading the flash kernel; tune `bk` per core. The scratch contract is already
+  the right shape for this — the kernel allocates nothing and touches only the caller's
+  block, so per-thread parallelism needs one `attn_flash_scratch_bytes(D, bk)` block per
+  thread and no other change. `bk` being runtime means threads on heterogeneous cores
+  (big.LITTLE, differing L2) can each use their own without a second build.
+- Add a short-suite case with `Sk > 128` to restore multi-key-block coverage to `./flash`
+  itself (see the coverage note under *Verification*).

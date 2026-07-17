@@ -17,10 +17,15 @@ echo "# compiler: $($CC --version | head -1)"
 echo "# qemu    : $($QEMU --version | head -1)"
 echo "# march   : $MARCH"
 
-for src in sanity attn flash; do
-  echo "== build $src =="
-  "$CC" -O2 -static -march="$MARCH" "$HERE/$src.c" -lm -o "$HERE/$src"
-  echo "== run $src =="
-  "$QEMU" -cpu max "$HERE/$src"
-  echo
-done
+echo "== build flash =="
+"$CC" -O2 -static -march="$MARCH" -Wall -Wextra "$HERE/flash.c" -lm -o "$HERE/flash"
+echo "== run flash (short suite, default bk) =="
+"$QEMU" -cpu max "$HERE/flash"
+echo
+echo "== self-test attn_flash_pick_bk's analytical cache model =="
+"$QEMU" -cpu max "$HERE/flash" --check-pick-bk
+echo
+echo "== more (not run here) =="
+echo "  $QEMU -cpu max $HERE/flash --bk 256      # same suite, another key block, NO REBUILD"
+echo "  $QEMU -cpu max $HERE/flash --sweep-bk    # tune bk (~20s; QEMU models no cache -- see README)"
+echo "  $QEMU -cpu max $HERE/flash --long        # + Qwen3 1k/2k/4k prefill sweep (~19 min)"
