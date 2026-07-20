@@ -15,8 +15,8 @@ cross-compiler + QEMU user-mode emulation.
 | File | Purpose |
 |---|---|
 | `flash.c` | **SVE-only BFDOT.** Flash-attention kernel: online softmax, key-blocked with a **runtime** key-block size `bk`, O(Bq·D + Bq·bk) memory, **allocation-free** (caller-owned scratch) + harness |
-| `tolerance_probe.c` | Measurement harness behind `flash.c`'s `TOL=8e-3`: prints `err/scale` under per-case / per-head / per-row normalisation and counts NaN reference rows. **Not part of the shipped kernel**; a **frozen snapshot** with its own private copy of the kernel (still `BK=64`, compile-time) — it is deliberately *not* kept in step with `flash.c`; build/run lines in its header |
-| `run.sh` | Build `flash.c` (AArch64, `-march=armv8.6-a+sve+bf16`) and run it under `qemu-aarch64 -cpu max` |
+| `build.sh` | Compile `flash.c` (AArch64, `-march=armv8.6-a+sve+bf16`) → `flash` |
+| `run.sh` | Run the built `flash` under `qemu-aarch64 -cpu max`; forwards args (e.g. `--bk 256`, `--prepack-v`, `--long`) |
 | `flash_long.log` | Recorded `./flash --long` output; header cites the md5 of the `flash.c` it came from |
 | `qemu_pkg/` | Locally-extracted `qemu-aarch64-static` (no root needed) |
 
@@ -559,9 +559,9 @@ any legal `bk`, no rebuild: **25/25 ALL PASS** over `bk` ∈ {32,64,128,256,512}
 
 ### Tolerance: `mad ≤ TOL·maxref`, `TOL = 8e-3`
 
-The pass bound is **measured, not guessed**. `tolerance_probe.c` swept 129 shapes
+The pass bound is **measured, not guessed**. A one-off measurement sweep of 129 shapes
 (`D` = 1…128, `Sq`/`Sk` block edges 63/64/65/127/128/129, `Sk<Sq`, GQA
-g = 1/2/4/16, decode, causal + non-causal) at **VL=512 and VL=2048**:
+g = 1/2/4/16, decode, causal + non-causal) at **VL=512 and VL=2048** produced:
 
 | statistic | `err/scale` on a correct kernel |
 |---|---|
@@ -681,8 +681,8 @@ standard); it was the *reference* that was wrong.
 > checked rows — 46% — were vacuous NaN passes** (rows 0..59 of each head attend no
 > keys at all). Its reported `err/scale=1.3e-03` was computed from the other 54%.
 > The `EXEC_LOG` recorded this limit as "absent from the shipped suite"; that was
-> incorrect (now corrected in place there), and `tolerance_probe.c` reports the
-> `360/780` count against the case it labels `ship:odd + multiblock`. The bug was
+> incorrect (now corrected in place there). The `360/780` vacuous-NaN count was
+> measured against the `odd + multiblock` case. The bug was
 > pre-existing and unrelated to the SVE port, but the case was not the clean
 > coverage its PASS implied.
 

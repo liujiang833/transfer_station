@@ -1,8 +1,7 @@
-# Built binaries (rebuild with ./run.sh)
+# Built binaries (rebuild with ./build.sh)
 /attn
 /flash
 /sanity
-/tolerance_probe
 *.o
 
 # Vendored qemu-aarch64-static (~145 MB) -- fetch without root per README:
