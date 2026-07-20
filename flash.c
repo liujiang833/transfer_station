@@ -73,7 +73,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 
 static inline uint16_t f32_to_bf16(float f) {
     uint32_t x;
@@ -555,12 +555,15 @@ size_t attn_flash_scratch_bytes(int D, int bk) {
     return attn_flash_layout(NULL, D, bk, NULL);
 }
 
-/* Wall-clock seconds (gettimeofday). Used by the harness and, when a caller opts in, by
- * attn_flash's per-phase timers below. */
+/* Monotonic seconds. MUST be CLOCK_MONOTONIC, not gettimeofday: the per-phase timers below
+ * accumulate many small deltas, and a non-monotonic wall clock (NTP step/slew, or a jumpy
+ * emulated clock) can run backward mid-measurement -- which showed up as a NEGATIVE sxv and
+ * a 10x-inflated qxk once timing was averaged over many runs. Monotonic time cannot go
+ * backward, and its nanosecond resolution is what a per-call benchmark needs anyway. */
 static double now_s(void) {
-    struct timeval t;
-    gettimeofday(&t, NULL);
-    return t.tv_sec + t.tv_usec * 1e-6;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
 }
 
 /* Per-phase wall-clock, accumulated over one attn_flash() call. Pass tm=NULL to disable
@@ -819,51 +822,154 @@ static int cmp_rows(const float *Oref, const float *Odot, int Hq, int Sq, int D,
     return (nbad == 0) && (mad <= TOL * maxref);
 }
 
+/* ---------------- benchmark controls (see main / usage) ----------------
+ * A timing is only meaningful if it (a) AVERAGES over many runs -- a single call is
+ * dominated by cold caches and clock granularity -- and (b) actually touches DRAM. So
+ * run_case rotates each timed call through a POOL of distinct Q/K/V (each with its own O)
+ * whose combined INPUT footprint is >= BENCH_DDR_MULT x the last-level cache: by the time
+ * the rotation wraps, that data has been evicted and must be reloaded from DDR -- exactly
+ * what a real inference sees (fresh Q/K/V per sequence/layer), NOT a cache-resident replay.
+ * A shape whose single Q/K/V already exceeds the target uses ONE copy (it streams from DRAM
+ * within a call anyway); only small shapes actually rotate. Scratch is deliberately NOT
+ * rotated -- it is the kernel's per-thread working set and legitimately stays hot. */
+static int g_warmup = 3;          /* untimed runs before measuring (warm the pipeline)      */
+static int g_iters = 0;           /* fixed timed-run count; 0 => adaptive to g_bench_secs    */
+static double g_bench_secs = 0.5; /* adaptive: keep timing a case until this many s elapsed  */
+static size_t g_llc_bytes = (size_t)512 * 1024 * 1024; /* LLC to overflow; --llc-mb N, 0=auto */
+#define BENCH_MIN_REPS 3          /* adaptive floor: never fewer than this many timed runs   */
+#define BENCH_DDR_MULT 2u         /* pool's total input >= this x LLC, so a wrap is cold      */
+#define BENCH_MAX_COPIES 8192     /* safety cap on the rotation pool (tiny shape, huge LLC)   */
+
+/* Largest CPU data/unified cache from sysfs -- the actual LLC, used only when --llc-mb 0
+ * asks to autodetect. Fallback 32 MiB when sysfs is unavailable (e.g. QEMU user-mode). The
+ * DEFAULT without --llc-mb is a fixed 512 MiB (g_llc_bytes), a deliberate over-estimate so
+ * the input pool exceeds even a large shared/system-level cache the per-cpu sysfs may miss. */
+static size_t detect_llc_bytes(void) {
+    size_t best = 0;
+    for (int i = 0; i < 16; i++) {
+        char path[128];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            break;
+        long v = 0;
+        char unit = 0;
+        if (fscanf(f, "%ld%c", &v, &unit) >= 1 && v > 0) {
+            size_t b = (size_t)v;
+            if (unit == 'K' || unit == 'k')
+                b *= 1024u;
+            else if (unit == 'M' || unit == 'm')
+                b *= 1024u * 1024u;
+            if (b > best)
+                best = b;
+        }
+        fclose(f);
+    }
+    return best ? best : (size_t)32 * 1024 * 1024;
+}
+
 static int run_case(const char *name, int Hq, int Hkv, int Sq, int Sk, int D, int causal,
                     int ref_cap, int bk, int prepack_v) {
     rng = 0x12345678u;
     size_t nq = (size_t)Hq * Sq * D, nk = (size_t)Hkv * Sk * D, no = (size_t)Hq * Sq * D;
-    uint16_t *Q = malloc(nq * 2), *K = malloc(nk * 2), *V = malloc(nk * 2);
-    for (size_t i = 0; i < nq; i++)
-        Q[i] = f32_to_bf16(frand());
-    for (size_t i = 0; i < nk; i++)
-        K[i] = f32_to_bf16(frand());
-    for (size_t i = 0; i < nk; i++)
-        V[i] = f32_to_bf16(frand());
-    /* Oref is zero-init AND only rows[] is ever read back: the reference leaves
-     * every unchecked row untouched, so neither loop may wander outside rows[]. */
-    float *Oref = calloc(no, 4), *Odot = calloc(no, 4);
-    int *rows = malloc(sizeof(int) * Sq);
-    int nrows = ref_rowset(Sq, ref_cap, rows);
-    attn_ref(Q, K, V, Oref, Hq, Hkv, Sq, Sk, D, causal, rows, nrows);
-    /* Intended DRIVER pattern for the allocation-free kernel: ask for the size, get one
-     * ATTN_SCRATCH_ALIGN-aligned block, hand it to every attn_flash() call, free it at
-     * the end. The size needs only D and bk -- not Sq/Sk -- so a real driver hoists this
-     * out of the sequence loop and keeps one block per thread for the process's lifetime.
-     * The alignment is a contract, not a nicety: aligned_alloc(), never plain malloc().
-     * Note the SAME bk sizes the block and drives the call. */
+
+    /* Size the DDR-cold rotation pool: NCOPIES distinct input sets so their total INPUT
+     * (Q+K+V, bf16) is >= BENCH_DDR_MULT x LLC. One Q/K/V is nq+2nk elements; when that
+     * alone already meets the target, a single copy suffices. */
+    size_t in_bytes = (nq + 2 * nk) * 2; /* one call's streamed input, bf16 */
+    size_t target = (size_t)BENCH_DDR_MULT * g_llc_bytes;
+    int ncopies = (int)((target + in_bytes - 1) / in_bytes);
+    if (ncopies < 1)
+        ncopies = 1;
+    if (ncopies > BENCH_MAX_COPIES)
+        ncopies = BENCH_MAX_COPIES;
+
+    /* One distinct random Q/K/V (and its own O) per copy; the RNG runs straight through, so
+     * no two copies share data. Vps[c] = V^T of copy c when pre-packing. */
+    uint16_t **Qs = malloc(sizeof(*Qs) * ncopies), **Ks = malloc(sizeof(*Ks) * ncopies),
+             **Vs = malloc(sizeof(*Vs) * ncopies),
+             **Vps = prepack_v ? malloc(sizeof(*Vps) * ncopies) : NULL;
+    float **Os = malloc(sizeof(*Os) * ncopies);
+    for (int c = 0; c < ncopies; c++) {
+        Qs[c] = malloc(nq * 2);
+        Ks[c] = malloc(nk * 2);
+        Vs[c] = malloc(nk * 2);
+        Os[c] = calloc(no, 4);
+        for (size_t i = 0; i < nq; i++)
+            Qs[c][i] = f32_to_bf16(frand());
+        for (size_t i = 0; i < nk; i++)
+            Ks[c][i] = f32_to_bf16(frand());
+        for (size_t i = 0; i < nk; i++)
+            Vs[c][i] = f32_to_bf16(frand());
+    }
+
+    /* One scratch block, reused by every call: the kernel's per-thread working set, which
+     * legitimately stays hot in a real driver. Its size needs only D and bk (not Sq/Sk). */
     size_t sbytes = attn_flash_scratch_bytes(D, bk);
     void *scratch = aligned_alloc(ATTN_SCRATCH_ALIGN, sbytes);
-    /* Optionally hoist the V transpose OUT of attention into a separate pack-V operator,
-     * timed on its own; attn_flash then runs with v_prepacked=1 and its packv phase is 0. */
-    const uint16_t *Vin = V;
-    uint16_t *Vp = NULL;
+
+    /* Pre-pack every copy's V^T so the rotating attention loop reads a valid Vps[c]; then
+     * time the pack operator itself (also DDR-cold -- it reads a different V per wrap). */
     double tpack = 0;
     if (prepack_v) {
-        Vp = malloc((size_t)Hkv * D * Sk * 2);
-        double tp0 = now_s();
-        pack_v_full(V, Vp, Hkv, Sk, D);
-        tpack = now_s() - tp0;
-        Vin = Vp;
+        for (int c = 0; c < ncopies; c++) {
+            Vps[c] = malloc((size_t)Hkv * D * Sk * 2);
+            pack_v_full(Vs[c], Vps[c], Hkv, Sk, D);
+        }
+        for (int w = 0; w < g_warmup; w++)
+            pack_v_full(Vs[w % ncopies], Vps[w % ncopies], Hkv, Sk, D);
+        int preps = 0;
+        double ps = now_s(), pe = 0;
+        for (;;) {
+            int c = preps % ncopies;
+            pack_v_full(Vs[c], Vps[c], Hkv, Sk, D);
+            preps++;
+            pe = now_s() - ps;
+            if (g_iters > 0 ? (preps >= g_iters) : (preps >= BENCH_MIN_REPS && pe >= g_bench_secs))
+                break;
+        }
+        tpack = pe / preps;
     }
-    struct attn_times tm = {0, 0, 0, 0};
-    double t0 = now_s();
-    attn_flash(Q, K, Vin, Odot, Hq, Hkv, Sq, Sk, D, causal, bk, scratch, prepack_v, &tm);
-    double tdot = now_s() - t0;
 
+    /* Correctness on copy 0 (untimed), against a matching fp32 reference. Oref is zero-init
+     * and only rows[] is read back, so neither loop may wander outside rows[]. */
+    float *Oref = calloc(no, 4);
+    int *rows = malloc(sizeof(int) * Sq);
+    int nrows = ref_rowset(Sq, ref_cap, rows);
+    attn_ref(Qs[0], Ks[0], Vs[0], Oref, Hq, Hkv, Sq, Sk, D, causal, rows, nrows);
+    attn_flash(Qs[0], Ks[0], prepack_v ? Vps[0] : Vs[0], Os[0], Hq, Hkv, Sq, Sk, D, causal, bk,
+               scratch, prepack_v, NULL);
     float mad, maxref;
     long nbad;
-    int ok = cmp_rows(Oref, Odot, Hq, Sq, D, rows, nrows, &mad, &maxref, &nbad);
+    int ok = cmp_rows(Oref, Os[0], Hq, Sq, D, rows, nrows, &mad, &maxref, &nbad);
+
+    /* Warmup (untimed), rotating so no single copy is unfairly pre-warmed. */
+    for (int w = 0; w < g_warmup; w++) {
+        int c = w % ncopies;
+        attn_flash(Qs[c], Ks[c], prepack_v ? Vps[c] : Vs[c], Os[c], Hq, Hkv, Sq, Sk, D, causal, bk,
+                   scratch, prepack_v, NULL);
+    }
+
+    /* Timed: rotate through the pool, averaging over many runs -- fixed --iters count, or
+     * adaptive (>= BENCH_MIN_REPS runs AND >= g_bench_secs wall-clock). */
+    struct attn_times tm = {0, 0, 0, 0};
+    int reps = 0;
+    double tstart = now_s(), elapsed = 0;
+    for (;;) {
+        int c = reps % ncopies;
+        attn_flash(Qs[c], Ks[c], prepack_v ? Vps[c] : Vs[c], Os[c], Hq, Hkv, Sq, Sk, D, causal, bk,
+                   scratch, prepack_v, &tm);
+        reps++;
+        elapsed = now_s() - tstart;
+        if (g_iters > 0 ? (reps >= g_iters) : (reps >= BENCH_MIN_REPS && elapsed >= g_bench_secs))
+            break;
+    }
+    double tdot = elapsed / reps; /* mean seconds per attention call */
+    tm.packv /= reps;
+    tm.qxk /= reps;
+    tm.softmax /= reps;
+    tm.sxv /= reps;
+
     char reflbl[48];
     if (nrows < Sq)
         snprintf(reflbl, sizeof reflbl, " [ref:%d rows spread 0..%d]", nrows, Sq - 1);
@@ -876,36 +982,53 @@ static int run_case(const char *name, int Hq, int Hkv, int Sq, int Sk, int D, in
         snprintf(verdict, sizeof verdict, "*** FAIL (%ld non-finite) ***", nbad);
     else
         snprintf(verdict, sizeof verdict, "%s", ok ? "PASS" : "*** FAIL ***");
-    char packlbl[56];
+    char packlbl[40];
     if (prepack_v)
-        snprintf(packlbl, sizeof packlbl, " [V pre-packed, sep-packv=%.4fs]", tpack);
+        snprintf(packlbl, sizeof packlbl, " sep-packv=%.5fs", tpack);
     else
         packlbl[0] = 0;
     double gflop = 4.0 * (double)Hq * D * attn_pairs(Sq, Sk, causal) / 1e9;
+    double pool_mib = (double)ncopies * in_bytes / (1024.0 * 1024.0);
     printf("%-17s H=%2d/%-2d(g%d) Sq=%-4d Sk=%-4d D=%3d bk=%-4d %s | err/scale=%.1e | %7.2f GFLOP "
-           "%7.3fs %5.2f GFLOP/s | pv/qk/sm/sv=%.4f/%.4f/%.4f/%.4f%s%s -> %s\n",
+           "%11.6fs/it x%-5d %6.2f GFLOP/s | pv/qk/sm/sv=%.5f/%.5f/%.5f/%.5f | ddr %dx=%.0fMiB%s%s "
+           "-> %s\n",
            name, Hq, Hkv, Hq / Hkv, Sq, Sk, D, bk, causal ? "causal" : "full  ",
-           maxref > 0 ? mad / maxref : 0.f, gflop, tdot, gflop / tdot, tm.packv, tm.qxk,
-           tm.softmax, tm.sxv, packlbl, reflbl, verdict);
-    free(Q);
-    free(K);
-    free(V);
-    free(Vp);
+           maxref > 0 ? mad / maxref : 0.f, gflop, tdot, reps, gflop / tdot, tm.packv, tm.qxk,
+           tm.softmax, tm.sxv, ncopies, pool_mib, packlbl, reflbl, verdict);
+
+    for (int c = 0; c < ncopies; c++) {
+        free(Qs[c]);
+        free(Ks[c]);
+        free(Vs[c]);
+        free(Os[c]);
+        if (prepack_v)
+            free(Vps[c]);
+    }
+    free(Qs);
+    free(Ks);
+    free(Vs);
+    free(Os);
+    free(Vps);
     free(Oref);
-    free(Odot);
     free(rows);
     free(scratch);
     return ok;
 }
 
 static void usage(const char *argv0) {
-    printf("usage: %s [--long] [--bk N] [--prepack-v]\n", argv0);
+    printf("usage: %s [--long] [--bk N] [--prepack-v] [--iters N] [--warmup N]\n", argv0);
+    printf("       %*s [--bench-secs S] [--llc-mb N]\n", (int)strlen(argv0), "");
     printf("  --bk N          run the short suite at key-block size N (power of two in\n");
     printf("                  [%d,%d]); default %d. bk is RUNTIME -- no rebuild needed.\n",
            ATTN_BK_MIN, ATTN_BK_MAX, ATTN_BK_DEFAULT);
     printf("  --long          also run the Qwen3 1k/2k/4k prefill sweep\n");
     printf("  --prepack-v     transpose V with a SEPARATE pack-V operator before attention\n");
     printf("                  (attn_flash runs v_prepacked=1; its packv phase drops to 0)\n");
+    printf("  --iters N       time exactly N runs per case (default: adaptive to --bench-secs)\n");
+    printf("  --warmup N      untimed warmup runs before timing (default 3)\n");
+    printf("  --bench-secs S  adaptive: keep timing a case until S seconds elapse (default 0.5)\n");
+    printf("  --llc-mb N      last-level cache (MiB) to overflow so inputs stream from DDR\n");
+    printf("                  (default 512; pass 0 to autodetect from sysfs)\n");
 }
 
 int main(int argc, char **argv) {
@@ -917,6 +1040,16 @@ int main(int argc, char **argv) {
             prepack_v = 1;
         else if (!strcmp(argv[i], "--bk") && i + 1 < argc)
             bk = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--iters") && i + 1 < argc)
+            g_iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--warmup") && i + 1 < argc)
+            g_warmup = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bench-secs") && i + 1 < argc)
+            g_bench_secs = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--llc-mb") && i + 1 < argc) {
+            size_t mb = strtoul(argv[++i], NULL, 10);
+            g_llc_bytes = mb ? mb * 1024u * 1024u : detect_llc_bytes(); /* 0 => autodetect */
+        }
         else {
             printf("unknown argument: %s\n", argv[i]);
             usage(argv[0]);
@@ -930,6 +1063,12 @@ int main(int argc, char **argv) {
         printf("bad --bk %d: must be a power of two in [%d, %d]\n", bk, ATTN_BK_MIN, ATTN_BK_MAX);
         return 2;
     }
+    if (g_warmup < 0)
+        g_warmup = 0;
+    if (g_iters < 0)
+        g_iters = 0;
+    if (g_bench_secs <= 0)
+        g_bench_secs = 0.5;
     int all = 1;
     printf("=== FLASH bf16 attention (online softmax, SVE BFDOT vs fp32 ref) ===\n");
     printf("SVE VL: svcntw()=%d f32 lanes, svcnth()=%d bf16 lanes (runtime, not hardcoded)\n",
@@ -939,6 +1078,17 @@ int main(int argc, char **argv) {
            prepack_v ? "SEPARATE operator (v_prepacked=1)" : "inside kernel (per key-block)");
     printf("per-phase times pv/qk/sm/sv = packv / qxk / softmax / sxv, seconds "
            "(pv=0 when V is pre-packed)\n");
+    {
+        char tdesc[64];
+        if (g_iters > 0)
+            snprintf(tdesc, sizeof tdesc, "%d timed runs/case", g_iters);
+        else
+            snprintf(tdesc, sizeof tdesc, "adaptive >=%.2gs/case (min %d)", g_bench_secs,
+                     BENCH_MIN_REPS);
+        printf("timing: %d warmup + %s, mean of the timed runs; DDR-cold input pool >= %ux "
+               "LLC=%.1f MiB (per line: /it = mean seconds, xN = runs, ddr Cx=MiB = pool)\n",
+               g_warmup, tdesc, BENCH_DDR_MULT, (double)g_llc_bytes / (1024.0 * 1024.0));
+    }
     all &= run_case("MHA prefill", 4, 4, 8, 8, 64, 0, 0, bk, prepack_v);
     all &= run_case("MHA prefil.causal", 4, 4, 8, 8, 64, 1, 0, bk, prepack_v);
     all &= run_case("GQA prefill", 8, 2, 8, 8, 64, 0, 0, bk, prepack_v);
@@ -970,8 +1120,8 @@ int main(int argc, char **argv) {
         all &= run_case("qwen3 2k", 16, 8, 2048, 2048, 128, 1, 8, bk, prepack_v);
         all &= run_case("qwen3 4k", 16, 8, 4096, 4096, 128, 1, 8, bk, prepack_v);
     } else
-        printf("(--long: Qwen3 1k/2k/4k sweep; --bk N: another key block; "
-               "--prepack-v: hoist V transpose out)\n");
+        printf("(--long: Qwen3 1k/2k/4k sweep; --bk N: another key block; --prepack-v: hoist V\n"
+               " transpose out; --iters/--warmup/--bench-secs/--llc-mb: tune the benchmark)\n");
     printf("=== %s ===\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }
