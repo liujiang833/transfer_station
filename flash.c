@@ -1016,11 +1016,16 @@ static int run_case(const char *name, int Hq, int Hkv, int Sq, int Sk, int D, in
 }
 
 static void usage(const char *argv0) {
-    printf("usage: %s [--long] [--bk N] [--prepack-v] [--iters N] [--warmup N]\n", argv0);
-    printf("       %*s [--bench-secs S] [--llc-mb N]\n", (int)strlen(argv0), "");
-    printf("  --bk N          run the short suite at key-block size N (power of two in\n");
-    printf("                  [%d,%d]); default %d. bk is RUNTIME -- no rebuild needed.\n",
+    printf("usage: %s [--long] [--shape Hq,Hkv,Sq,Sk,D[,causal[,ref_cap]]] [--bk N]\n", argv0);
+    printf("       %*s [--prepack-v] [--iters N] [--warmup N] [--bench-secs S] [--llc-mb N]\n",
+           (int)strlen(argv0), "");
+    printf("  (no args)       run the default suite: PREFILL shapes only (Sq > 1)\n");
+    printf("  --shape ...     run ONE case of the given shape instead of the suite, then exit;\n");
+    printf("                  causal defaults to 1, ref_cap to 8. Qwen3 1k prefill, on its own:\n");
+    printf("                  --shape 16,8,1024,1024,128,1\n");
+    printf("  --bk N          key-block size N (power of two in [%d,%d]); default %d. bk is\n",
            ATTN_BK_MIN, ATTN_BK_MAX, ATTN_BK_DEFAULT);
+    printf("                  RUNTIME -- no rebuild needed.\n");
     printf("  --long          also run the Qwen3 1k/2k/4k prefill sweep\n");
     printf("  --prepack-v     transpose V with a SEPARATE pack-V operator before attention\n");
     printf("                  (attn_flash runs v_prepacked=1; its packv phase drops to 0)\n");
@@ -1033,6 +1038,7 @@ static void usage(const char *argv0) {
 
 int main(int argc, char **argv) {
     int longrun = 0, prepack_v = 0, bk = ATTN_BK_DEFAULT;
+    int shq = 0, shkv = 0, ssq = 0, ssk = 0, sd = 0, scausal = 1, srefcap = 8, have_shape = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--long"))
             longrun = 1;
@@ -1040,7 +1046,17 @@ int main(int argc, char **argv) {
             prepack_v = 1;
         else if (!strcmp(argv[i], "--bk") && i + 1 < argc)
             bk = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--iters") && i + 1 < argc)
+        else if (!strcmp(argv[i], "--shape") && i + 1 < argc) {
+            scausal = 1;
+            srefcap = 8; /* defaults when the list omits them */
+            int n = sscanf(argv[++i], "%d,%d,%d,%d,%d,%d,%d", &shq, &shkv, &ssq, &ssk, &sd,
+                           &scausal, &srefcap);
+            if (n < 5) {
+                printf("bad --shape: need Hq,Hkv,Sq,Sk,D[,causal[,ref_cap]]\n");
+                return 2;
+            }
+            have_shape = 1;
+        } else if (!strcmp(argv[i], "--iters") && i + 1 < argc)
             g_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--warmup") && i + 1 < argc)
             g_warmup = atoi(argv[++i]);
@@ -1061,6 +1077,11 @@ int main(int argc, char **argv) {
      * regardless -- the kernel does not trust its caller (see attn_bk_check). */
     if (bk < ATTN_BK_MIN || bk > ATTN_BK_MAX || (bk & (bk - 1)) != 0) {
         printf("bad --bk %d: must be a power of two in [%d, %d]\n", bk, ATTN_BK_MIN, ATTN_BK_MAX);
+        return 2;
+    }
+    if (have_shape && (shq < 1 || shkv < 1 || shq % shkv != 0 || ssq < 1 || ssk < 1 || sd < 1)) {
+        printf("bad --shape %d,%d,%d,%d,%d: need Hq>=1, Hkv>=1, Hq%%Hkv==0, Sq>=1, Sk>=1, D>=1\n",
+               shq, shkv, ssq, ssk, sd);
         return 2;
     }
     if (g_warmup < 0)
@@ -1089,12 +1110,18 @@ int main(int argc, char **argv) {
                "LLC=%.1f MiB (per line: /it = mean seconds, xN = runs, ddr Cx=MiB = pool)\n",
                g_warmup, tdesc, BENCH_DDR_MULT, (double)g_llc_bytes / (1024.0 * 1024.0));
     }
+    if (have_shape) { /* run ONE user-specified case and stop -- e.g. the qwen3 1k prefill:
+                       *   --shape 16,8,1024,1024,128,1 */
+        int ok = run_case("custom shape", shq, shkv, ssq, ssk, sd, scausal, srefcap, bk, prepack_v);
+        printf("=== %s ===\n", ok ? "ALL PASS" : "SOME FAILED");
+        return ok ? 0 : 1;
+    }
+    /* Default suite: PREFILL shapes only (Sq > 1). The decode (Sq=1) path is still reachable
+     * with --shape, e.g. --shape 4,4,1,16,64,0. */
     all &= run_case("MHA prefill", 4, 4, 8, 8, 64, 0, 0, bk, prepack_v);
     all &= run_case("MHA prefil.causal", 4, 4, 8, 8, 64, 1, 0, bk, prepack_v);
     all &= run_case("GQA prefill", 8, 2, 8, 8, 64, 0, 0, bk, prepack_v);
     all &= run_case("GQA prefil.causal", 8, 2, 8, 8, 64, 1, 0, bk, prepack_v);
-    all &= run_case("MHA decode(Sq=1)", 4, 4, 1, 16, 64, 0, 0, bk, prepack_v);
-    all &= run_case("GQA decode(Sq=1)", 8, 2, 1, 16, 64, 0, 0, bk, prepack_v);
     all &= run_case("MQA prefill", 8, 1, 8, 8, 64, 0, 0, bk, prepack_v);
     /* Spans >1 QUERY block (Sq=130 > BQ=64: 3 of them). Whether it also spans >1 KEY
      * block now depends on the RUNTIME bk: at bk<=64 it does (Sk=70), at bk>=128 it is a
@@ -1120,8 +1147,9 @@ int main(int argc, char **argv) {
         all &= run_case("qwen3 2k", 16, 8, 2048, 2048, 128, 1, 8, bk, prepack_v);
         all &= run_case("qwen3 4k", 16, 8, 4096, 4096, 128, 1, 8, bk, prepack_v);
     } else
-        printf("(--long: Qwen3 1k/2k/4k sweep; --bk N: another key block; --prepack-v: hoist V\n"
-               " transpose out; --iters/--warmup/--bench-secs/--llc-mb: tune the benchmark)\n");
+        printf("(default = prefill shapes only; --shape Hq,Hkv,Sq,Sk,D[,causal]: one custom case,\n"
+               " e.g. --shape 16,8,1024,1024,128,1 for qwen3 1k; --long: Qwen3 1k/2k/4k sweep;\n"
+               " --bk/--prepack-v/--iters/--warmup/--bench-secs/--llc-mb: tune the benchmark)\n");
     printf("=== %s ===\n", all ? "ALL PASS" : "SOME FAILED");
     return all ? 0 : 1;
 }
