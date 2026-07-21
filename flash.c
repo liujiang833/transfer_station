@@ -111,7 +111,7 @@ static inline float bf16_to_f32(uint16_t h) {
  * (svcntw/svcnth/svwhilelt at runtime): VL motivates the choice of bk, it never
  * constrains correctness. */
 #ifndef BQ
-#define BQ 64 /* query block -- compile-time on purpose; see above */
+#define BQ 128 /* query block -- compile-time on purpose; see above */
 #endif
 #ifndef UNR
 #define UNR 4 /* independent BFDOT accumulators per pass (hides svaddv latency) */
@@ -123,7 +123,7 @@ static inline float bf16_to_f32(uint16_t h) {
  * design targets, and the bfdot/svaddv ratio -- the reason bk exists as a knob -- drops
  * under 1. Smaller bk would still compute the RIGHT answer (all tails are predicated);
  * the floor is a "you are holding it wrong" guard, not a correctness requirement.
- * ATTN_BK_MAX = 4096: at BQ=64 the S tile alone is 4*BQ*bk = 1 MiB there, so the
+ * ATTN_BK_MAX = 4096: at BQ=128 the S tile alone is 4*BQ*bk = 2 MiB there, so the
  * O(Bq*D + Bq*bk) memory property -- the entire point of flash attention -- has already
  * stopped meaning anything. Also keeps every layout product far from overflow.
  * A power of two is a USER REQUIREMENT, not an implementation need: the kernel's loops
@@ -346,7 +346,7 @@ static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride
  * D-tail so BFDOT's pairwise lanes contribute 0 there. UNR keys per pass.
  * params: Qb,Kb = this block's Q / K, row-major [rq x D] / [rk x D], read in place
  *         S     = output score tile [rq x rk] f32, row stride Sstride
- *         rq    = REAL query rows in this block (<= BQ = 64; smaller on the last query-block)
+ *         rq    = REAL query rows in this block (<= BQ = 128; smaller on the last query-block)
  *         rk    = REAL keys   in this block (<= bk;      smaller on the last key-block)
  *         D     = head_dim = contraction length;  Sstride = S row stride;  scale = 1/sqrt(D) */
 FORCE_NOINLINE
@@ -1289,7 +1289,7 @@ int main(int argc, char **argv) {
     all &= run_case("GQA prefill", 8, 2, 8, 8, 64, 0, 0, bk, prepack_v);
     all &= run_case("GQA prefil.causal", 8, 2, 8, 8, 64, 1, 0, bk, prepack_v);
     all &= run_case("MQA prefill", 8, 1, 8, 8, 64, 0, 0, bk, prepack_v);
-    /* Spans >1 QUERY block (Sq=130 > BQ=64: 3 of them). Whether it also spans >1 KEY
+    /* Spans >1 QUERY block (Sq=130 > BQ=128: 2 of them). Whether it also spans >1 KEY
      * block now depends on the RUNTIME bk: at bk<=64 it does (Sk=70), at bk>=128 it is a
      * single PARTIAL block and the name's "multiblock" refers to the query axis only.
      * Either way it covers the Sk<Sq causal case where early rows attend no keys (the
