@@ -2,6 +2,7 @@
 /attn
 /flash
 /sanity
+/bfdot_peak
 *.o
 
 # Vendored qemu-aarch64-static (~145 MB) -- fetch without root per README:
