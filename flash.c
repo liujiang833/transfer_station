@@ -157,6 +157,56 @@ static inline float bf16_to_f32(uint16_t h) {
 #define FORCE_NOINLINE
 #endif
 
+/* ---------------- software prefetch (memory-bound tuning) ----------------
+ * Top-down put this kernel at ~50% L2-bound + ~27% L3-bound: it stalls on DATA LATENCY, not
+ * compute (intensity is ~1 byte/cycle, so it is latency- not bandwidth-bound). Two miss sources,
+ * two prefetch parts. TUNE ON REAL HARDWARE -- QEMU treats PRFM as a no-op, so these defaults are
+ * only a starting point, and correctness is identical with prefetch on or off.
+ *
+ *   Part A  block stream-ahead  (the L3/DRAM fill): each key-block's K (and V) is cold. While
+ *           computing block kj, prefetch block kj + PF_BLK_AHEAD into L2 so the fill is hidden
+ *           before qk_tile / pack_vt demand it. Covers contiguous K/V and strided V^T (prepacked).
+ *   Part B  operand look-ahead  (the L2 re-read): qk_tile re-reads the whole 32 KiB K block once
+ *           PER query row, pv_acc the whole V^T block -- they thrash L1 against S/acc, so re-reads
+ *           hit L2. Prime the next UNR-group from L2 into L1, PF_GDIST groups ahead of the BFDOT.
+ *
+ * Build a clean baseline with -DPF_ENABLE=0; sweep the rest with -DPF_BLK_AHEAD=n -DPF_GDIST=n. */
+#ifndef PF_ENABLE
+#define PF_ENABLE 1 /* master switch: 0 compiles out every PRFM */
+#endif
+#ifndef PF_BLK_AHEAD
+#define PF_BLK_AHEAD 1 /* Part A: key-blocks ahead to stage DRAM->L2 (0 disables Part A) */
+#endif
+#ifndef PF_GDIST
+#define PF_GDIST 2 /* Part B: UNR-groups ahead to prime L2->L1 (0 disables Part B) */
+#endif
+#ifndef PF_LOC_L1
+#define PF_LOC_L1 3 /* __builtin_prefetch locality: 3=L1, 2=L2, 1=L3, 0=non-temporal */
+#endif
+#ifndef PF_LOC_L2
+#define PF_LOC_L2 2 /* far/block prefetch target level */
+#endif
+#if PF_ENABLE
+/* PRFM never faults, so a range that runs slightly past a tensor is harmless -- no bounds guard
+ * needed at call sites. The locality arg to __builtin_prefetch MUST be a literal, hence macros. */
+#define PF_ONE(addr, loc) __builtin_prefetch((const void *)(addr), 0, (loc))
+#define PF_RANGE(base, bytes, loc)                                                                 \
+    do {                                                                                           \
+        const char *pf_p_ = (const char *)(base);                                                  \
+        size_t pf_b_ = (size_t)(bytes);                                                            \
+        for (size_t pf_o_ = 0; pf_o_ < pf_b_; pf_o_ += 64)                                         \
+            __builtin_prefetch(pf_p_ + pf_o_, 0, (loc));                                           \
+    } while (0)
+#else
+#define PF_ONE(addr, loc) ((void)0)
+#define PF_RANGE(base, bytes, loc) ((void)0)
+#endif
+#if PF_ENABLE && PF_GDIST > 0
+#define PF_OPERAND 1 /* Part B compiled in */
+#else
+#define PF_OPERAND 0
+#endif
+
 /* ---------------- fast_exp: SVE exp, ported from kutacc/src/math/fast_exp.h ----------------
  * svexpa-based exp2: add a magic bias so the integer part of z0 lands in the
  * mantissa (z4), recover the fraction (z1), evaluate a degree-2 poly on it, and
@@ -295,6 +345,9 @@ static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, in
         int j = 0;
         for (; j + UNR <= rk; j += UNR) {
             const uint16_t *k0 = Kb + (size_t)j * D;
+#if PF_OPERAND /* Part B: prime the K group PF_GDIST groups ahead (L2 re-read -> L1) */
+            PF_ONE(k0 + (size_t)PF_GDIST * UNR * D, PF_LOC_L1);
+#endif
             svfloat32_t a0 = svdup_n_f32(0), a1 = svdup_n_f32(0);
 #if UNR >= 4
             svfloat32_t a2 = svdup_n_f32(0), a3 = svdup_n_f32(0);
@@ -357,6 +410,9 @@ static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const flo
         int d = 0;
         for (; d + UNR <= D; d += UNR) {
             const uint16_t *v0 = Vt + (size_t)d * Vstride;
+#if PF_OPERAND /* Part B: prime the V^T rows PF_GDIST groups ahead (strided under --prepack-v) */
+            PF_ONE(v0 + (size_t)PF_GDIST * UNR * Vstride, PF_LOC_L1);
+#endif
             svfloat32_t a0 = svdup_n_f32(0), a1 = svdup_n_f32(0);
 #if UNR >= 4
             svfloat32_t a2 = svdup_n_f32(0), a3 = svdup_n_f32(0);
@@ -691,6 +747,24 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
                 int rk = Sk - kj; /* rk = real keys in this block */
                 if (rk > bk)
                     rk = bk;
+#if PF_ENABLE && PF_BLK_AHEAD > 0
+                { /* Part A: stage the K/V block PF_BLK_AHEAD key-blocks ahead into L2 */
+                    int kjn = kj + PF_BLK_AHEAD * bk;
+                    if (kjn < Sk && !(causal && kjn > off + qi + rq - 1)) {
+                        int rkn = Sk - kjn;
+                        if (rkn > bk)
+                            rkn = bk;
+                        PF_RANGE(Kh + (size_t)kjn * D, (size_t)rkn * D * sizeof(uint16_t), PF_LOC_L2);
+                        if (v_prepacked) /* V^T: rkn columns of each of D rows, stride Sk */
+                            for (int d = 0; d < D; d++)
+                                PF_RANGE(Vh + (size_t)d * Sk + kjn, (size_t)rkn * sizeof(uint16_t),
+                                         PF_LOC_L2);
+                        else /* contiguous V block, transposed on demand by pack_vt */
+                            PF_RANGE(Vh + (size_t)kjn * D, (size_t)rkn * D * sizeof(uint16_t),
+                                     PF_LOC_L2);
+                    }
+                }
+#endif
                 double t = 0; /* set/read only under `if (tm)`; init silences -Wmaybe-uninit */
                 const uint16_t *Vblk;
                 if (v_prepacked) {
