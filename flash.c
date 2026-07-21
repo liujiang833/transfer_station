@@ -607,6 +607,12 @@ static void pack_v_full(const uint16_t *V, uint16_t *Vp, int Hkv, int Sk, int D)
         pack_vt(V + (size_t)kv * Sk * D, Vp + (size_t)kv * (size_t)D * Sk, Sk, D, Sk);
 }
 
+/* Profiling knob (set by --no-softmax): skip the softmax phase so a top-down run isolates the
+ * two BFDOT matmuls (and the pack) from softmax's branches + exp. The result is intentionally
+ * WRONG in this mode -- run_case labels it "no-softmax" and does not FAIL. pv_acc still runs its
+ * full, data-independent BFDOT: Pb is zero-filled once and al forced to 1 so it reads valid P. */
+static int g_no_softmax = 0;
+
 /* ---------------- flash attention forward ---------------- */
 static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, float *O, int Hq,
                        int Hkv, int Sq, int Sk, int D, int causal, int bk, void *scratch,
@@ -657,6 +663,8 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
     uint16_t *Vt = s.Vt, *Pb = s.Pb;
     float *S = s.S, *pv = s.pv;
     float *acc = s.acc, *m = s.m, *l = s.l, *al = s.al;
+    if (g_no_softmax) /* profiling: hand pv_acc a valid, constant P so its BFDOT still runs */
+        memset(Pb, 0, (size_t)BQ * Pstride * sizeof(uint16_t));
 
     for (int h = 0; h < Hq; h++) {
         int kv = h / group; /* kv head feeding this query head */
@@ -672,6 +680,9 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
                 m[i] = -INFINITY;
                 l[i] = 0;
             }
+            if (g_no_softmax) /* softmax normally sets al every block; here fix it to identity */
+                for (int i = 0; i < rq; i++)
+                    al[i] = 1.f;
             memset(acc, 0, sizeof(float) * rq * D);
 
             for (int kj = 0; kj < Sk; kj += bk) { /* kj = key-block start */
@@ -699,7 +710,8 @@ static void attn_flash(const uint16_t *Q, const uint16_t *K, const uint16_t *V, 
                     tm->qxk += now_s() - t;
                 if (tm)
                     t = now_s();
-                softmax_block(S, Pb, m, l, al, rq, rk, Sstride, Pstride, kj, off + qi, causal);
+                if (!g_no_softmax) /* --no-softmax: drop this phase for top-down isolation */
+                    softmax_block(S, Pb, m, l, al, rq, rk, Sstride, Pstride, kj, off + qi, causal);
                 if (tm)
                     tm->softmax += now_s() - t;
                 if (tm)
@@ -995,7 +1007,9 @@ static int run_case(const char *name, int Hq, int Hkv, int Sq, int Sk, int D, in
     /* A non-finite element is named, not just counted into a bare FAIL: err/scale
      * is computed from the finite rest and so looks innocent when NaN is the bug. */
     char verdict[40];
-    if (nbad)
+    if (g_no_softmax) /* output is intentionally wrong here -- do not compare, do not FAIL */
+        snprintf(verdict, sizeof verdict, "no-softmax (profiling)");
+    else if (nbad)
         snprintf(verdict, sizeof verdict, "*** FAIL (%ld non-finite) ***", nbad);
     else
         snprintf(verdict, sizeof verdict, "%s", ok ? "PASS" : "*** FAIL ***");
@@ -1046,6 +1060,8 @@ static void usage(const char *argv0) {
     printf("  --long          also run the Qwen3 1k/2k/4k prefill sweep\n");
     printf("  --prepack-v     transpose V with a SEPARATE pack-V operator before attention\n");
     printf("                  (attn_flash runs v_prepacked=1; its packv phase drops to 0)\n");
+    printf("  --no-softmax    PROFILING: skip the softmax phase to isolate the BFDOT matmuls in\n");
+    printf("                  a top-down run. Output is intentionally wrong (line says no-softmax)\n");
     printf("  --iters N       time exactly N runs per case (default: adaptive to --bench-secs)\n");
     printf("  --warmup N      untimed warmup runs before timing (default 3)\n");
     printf("  --bench-secs S  adaptive: keep timing a case until S seconds elapse (default 0.5)\n");
@@ -1061,6 +1077,8 @@ int main(int argc, char **argv) {
             longrun = 1;
         else if (!strcmp(argv[i], "--prepack-v"))
             prepack_v = 1;
+        else if (!strcmp(argv[i], "--no-softmax"))
+            g_no_softmax = 1;
         else if (!strcmp(argv[i], "--bk") && i + 1 < argc)
             bk = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shape") && i + 1 < argc) {
@@ -1116,6 +1134,9 @@ int main(int argc, char **argv) {
            prepack_v ? "SEPARATE operator (v_prepacked=1)" : "inside kernel (per key-block)");
     printf("per-phase times pv/qk/sm/sv = packv / qxk / softmax / sxv, seconds "
            "(pv=0 when V is pre-packed)\n");
+    if (g_no_softmax)
+        printf("*** --no-softmax: softmax phase DISABLED for top-down profiling; sm~0 and "
+               "outputs are intentionally wrong ***\n");
     {
         char tdesc[64];
         if (g_iters > 0)
