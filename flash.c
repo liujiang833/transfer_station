@@ -320,7 +320,10 @@ static void attn_ref(const uint16_t *Q, const uint16_t *K, const uint16_t *V, fl
 
 /* V^T pack: Vt[d][k] = Vb[k][d]. The only transpose in the kernel -- P.V needs V
  * key-major. Vectorised with a 16-bit gather (index k*D, in bf16 elements) and a
- * truncating 32->16 store; cost is O(rk*D) per key-block, amortised over rq rows. */
+ * truncating 32->16 store; cost is O(rk*D) per key-block, amortised over rq rows.
+ * params: Vb = this key-block's V (&V[kj]), key-major [rk x D];  Vt = output V^T buffer
+ *         rk = REAL keys in this block (<= bk; smaller only on the last key-block)
+ *         D  = head_dim;  Vstride = Vt row stride (bk for a per-block tile, Sk for a full V^T) */
 FORCE_NOINLINE
 static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride) {
     /* locals: Vb key-major in [rk x D], Vt feature-major out [D x Vstride], Vt[d][k] = Vb[k][d].
@@ -340,7 +343,12 @@ static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride
 
 /* QK^T: S[i][j] = scale * dot(Qb[i][:], Kb[j][:]) over D. Both operands are read
  * straight from the tensors (contiguous in d); the whilelt_b16 load zeroes the
- * D-tail so BFDOT's pairwise lanes contribute 0 there. UNR keys per pass. */
+ * D-tail so BFDOT's pairwise lanes contribute 0 there. UNR keys per pass.
+ * params: Qb,Kb = this block's Q / K, row-major [rq x D] / [rk x D], read in place
+ *         S     = output score tile [rq x rk] f32, row stride Sstride
+ *         rq    = REAL query rows in this block (<= BQ = 64; smaller on the last query-block)
+ *         rk    = REAL keys   in this block (<= bk;      smaller on the last key-block)
+ *         D     = head_dim = contraction length;  Sstride = S row stride;  scale = 1/sqrt(D) */
 FORCE_NOINLINE
 static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, int rk, int D,
                     int Sstride, float scale) {
@@ -415,7 +423,13 @@ static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, in
 }
 
 /* P.V + online rescale, fused: acc[i][d] = al[i]*acc[i][d] + sum_k P[i][k]*Vt[d][k].
- * Contraction is over k, contiguous in both P and Vt. UNR dims d per pass. */
+ * Contraction is over k, contiguous in both P and Vt. UNR dims d per pass.
+ * params: Pb  = softmax probs P for this block, bf16 [rq x rk], row stride Pstride
+ *         Vt  = V^T for this block, feature-major, row stride Vstride
+ *         acc = running output [rq x D] f32, UPDATED in place;  al = rescale alpha[rq] from softmax
+ *         pv  = [D] scratch for one row's partial dot
+ *         rq,rk = REAL query rows / keys in this block (<= BQ / bk; shrink on the tail blocks)
+ *         D   = head_dim = output width;  Pstride,Vstride = row strides of Pb, Vt */
 FORCE_NOINLINE
 static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const float *al, float *pv,
                    int rq, int rk, int D, int Pstride, int Vstride) {
@@ -495,7 +509,12 @@ static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const flo
     }
 }
 
-/* Mask + online-softmax update for one key-block; writes P (bf16) and al[]. */
+/* Mask + online-softmax update for one key-block; writes P (bf16) and al[].
+ * params: S   = score tile [rq x rk] f32 from qk_tile (read);  Pb = probs P out, bf16 [rq x rk]
+ *         m,l = running row-max[rq] / denominator[rq], UPDATED;  al = rescale alpha[rq] out
+ *         rq,rk = REAL query rows / keys in this block (<= BQ / bk; shrink on the tail blocks)
+ *         Sstride,Pstride = row strides of S, Pb;  kj = this block's first key index (global, [0,Sk))
+ *         qbase = Sk - Sq + qi, so row i may attend keys 0..qbase+i;  causal = enable the mask */
 FORCE_NOINLINE
 static void softmax_block(float *S, uint16_t *Pb, float *m, float *l, float *al, int rq, int rk,
                           int Sstride, int Pstride, int kj, int qbase, int causal) {
