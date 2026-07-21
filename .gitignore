@@ -11,3 +11,6 @@
 
 # Vendored python tooling (clang-format etc.)
 /.pytools/
+
+# Performance-modeling workspace (local analysis + generated .xlsx; not part of the kernel)
+/modeling/
