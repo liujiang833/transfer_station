@@ -145,6 +145,18 @@ static inline float bf16_to_f32(uint16_t h) {
 #define BF(p) ((const bfloat16_t *)(p)) /* uint16_t bf16 storage -> intrinsic type */
 #define BFW(p) ((bfloat16_t *)(p))
 
+/* FORCE_NOINLINE: keep each phase (pack_v/qk_tile/softmax/pv_acc) a distinct symbol so it
+ * shows up as its own frame in a flame graph. Target compiler is clang, which honours plain
+ * noinline; check __clang__ FIRST because clang also defines __GNUC__. Under GCC we additionally
+ * pass noclone so IPA-clone copies can't smuggle the body back inline. */
+#if defined(__clang__)
+#define FORCE_NOINLINE __attribute__((noinline))
+#elif defined(__GNUC__)
+#define FORCE_NOINLINE __attribute__((noinline, noclone))
+#else
+#define FORCE_NOINLINE
+#endif
+
 /* ---------------- fast_exp: SVE exp, ported from kutacc/src/math/fast_exp.h ----------------
  * svexpa-based exp2: add a magic bias so the integer part of z0 lands in the
  * mantissa (z4), recover the fraction (z1), evaluate a degree-2 poly on it, and
@@ -259,6 +271,7 @@ static void attn_ref(const uint16_t *Q, const uint16_t *K, const uint16_t *V, fl
 /* V^T pack: Vt[d][k] = Vb[k][d]. The only transpose in the kernel -- P.V needs V
  * key-major. Vectorised with a 16-bit gather (index k*D, in bf16 elements) and a
  * truncating 32->16 store; cost is O(rk*D) per key-block, amortised over rq rows. */
+FORCE_NOINLINE
 static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride) {
     int VLw = (int)svcntw();
     for (int d = 0; d < D; d++)
@@ -272,6 +285,7 @@ static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride
 /* QK^T: S[i][j] = scale * dot(Qb[i][:], Kb[j][:]) over D. Both operands are read
  * straight from the tensors (contiguous in d); the whilelt_b16 load zeroes the
  * D-tail so BFDOT's pairwise lanes contribute 0 there. UNR keys per pass. */
+FORCE_NOINLINE
 static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, int rk, int D,
                     int Sstride, float scale) {
     int VLh = (int)svcnth();
@@ -333,6 +347,7 @@ static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, in
 
 /* P.V + online rescale, fused: acc[i][d] = al[i]*acc[i][d] + sum_k P[i][k]*Vt[d][k].
  * Contraction is over k, contiguous in both P and Vt. UNR dims d per pass. */
+FORCE_NOINLINE
 static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const float *al, float *pv,
                    int rq, int rk, int D, int Pstride, int Vstride) {
     int VLh = (int)svcnth(), VLw = (int)svcntw();
@@ -400,6 +415,7 @@ static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const flo
 }
 
 /* Mask + online-softmax update for one key-block; writes P (bf16) and al[]. */
+FORCE_NOINLINE
 static void softmax_block(float *S, uint16_t *Pb, float *m, float *l, float *al, int rq, int rk,
                           int Sstride, int Pstride, int kj, int qbase, int causal) {
     int VLw = (int)svcntw(), VLh = (int)svcnth();
@@ -585,6 +601,7 @@ struct attn_times {
  * header). It reuses the EXACT pack_vt() transpose (rk=Sk, Vstride=Sk), so the pre-packed
  * bytes are bit-for-bit what attn_flash reads in that mode -- one transpose, no second
  * copy to drift. Output buffer holds Hkv*D*Sk bf16 elements. */
+FORCE_NOINLINE
 static void pack_v_full(const uint16_t *V, uint16_t *Vp, int Hkv, int Sk, int D) {
     for (int kv = 0; kv < Hkv; kv++)
         pack_vt(V + (size_t)kv * Sk * D, Vp + (size_t)kv * (size_t)D * Sk, Sk, D, Sk);
