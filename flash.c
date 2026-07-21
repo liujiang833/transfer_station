@@ -323,6 +323,12 @@ static void attn_ref(const uint16_t *Q, const uint16_t *K, const uint16_t *V, fl
  * truncating 32->16 store; cost is O(rk*D) per key-block, amortised over rq rows. */
 FORCE_NOINLINE
 static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride) {
+    /* locals: Vb key-major in [rk x D], Vt feature-major out [D x Vstride], Vt[d][k] = Vb[k][d].
+     *   VLw  f32 lanes per vector = keys gathered per pass (the gather widens bf16 into 32-bit lanes)
+     *   d    output row = source column (a head-dim feature);  k = key index, VLw at a time
+     *   pg   whilelt predicate for the key tail (k >= rk)
+     *   g    column d of keys k..k+VLw-1, gathered by element-index (base k*D, step D), then
+     *        truncated 32->16 on store (a bf16's bits are the low half of each 32-bit lane) */
     int VLw = (int)svcntw();
     for (int d = 0; d < D; d++)
         for (int k = 0; k < rk; k += VLw) {
@@ -338,6 +344,16 @@ static void pack_vt(const uint16_t *Vb, uint16_t *Vt, int rk, int D, int Vstride
 FORCE_NOINLINE
 static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, int rk, int D,
                     int Sstride, float scale) {
+    /* locals -- GEMM shape is M = query rows (i), N = keys (j), K = head_dim (d):
+     *   VLh   bf16 lanes per SVE vector = BFDOT step along d (runtime, VL-agnostic)
+     *   pg32  all-true f32 predicate, used only for the svaddv horizontal reductions
+     *   i,qr  query row index (M) and its D contiguous bf16 (qr is reused across every key)
+     *   j,k0  key index (N), UNR at a time;  k0 = first of the UNR contiguous key rows
+     *   d,pg  head_dim offset (K) and the whilelt-b16 load that zeroes the D-tail
+     *   qv    one Q row's bf16 vector -- the shared left operand fed to all UNR BFDOTs
+     *   a0..  UNR independent dot accumulators (one per key j+u), in separate registers so the
+     *         UNR svaddv latencies overlap instead of serialising
+     *   Sr    &S[i][j];  Sr[u] receives the scaled dot for key j+u */
     int VLh = (int)svcnth();
     svbool_t pg32 = svptrue_b32();
     for (int i = 0; i < rq; i++) {
@@ -403,6 +419,15 @@ static void qk_tile(const uint16_t *Qb, const uint16_t *Kb, float *S, int rq, in
 FORCE_NOINLINE
 static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const float *al, float *pv,
                    int rq, int rk, int D, int Pstride, int Vstride) {
+    /* locals -- computes acc[i][d] = al[i]*acc[i][d] + sum_k P[i][k]*Vt[d][k], contracting over k:
+     *   VLh    bf16 lanes = BFDOT step along k;  VLw = f32 lanes = step of the final rescale FMA
+     *   pg32   all-true f32 predicate for the svaddv reductions
+     *   i,pr   query row and its rk contiguous P values (pr is reused across every output dim)
+     *   d,v0   output feature index (UNR at a time);  v0 = first of the UNR V^T rows for this group
+     *   k,pg   contraction/key offset and the whilelt-b16 load that zeroes the k-tail
+     *   pvec   one P row's bf16 vector -- the shared left operand for all UNR BFDOTs
+     *   a0..   UNR independent accumulators (one per output dim d+u)
+     *   pv[d]  reduced dot for dim d;  av = alpha broadcast;  ar = &acc[i];  e = rescale-FMA offset */
     int VLh = (int)svcnth(), VLw = (int)svcntw();
     svbool_t pg32 = svptrue_b32();
     for (int i = 0; i < rq; i++) {
@@ -474,6 +499,16 @@ static void pv_acc(const uint16_t *Pb, const uint16_t *Vt, float *acc, const flo
 FORCE_NOINLINE
 static void softmax_block(float *S, uint16_t *Pb, float *m, float *l, float *al, int rq, int rk,
                           int Sstride, int Pstride, int kj, int qbase, int causal) {
+    /* locals -- online-softmax update of the running (m, l) state for this key-block:
+     *   VLw,VLh   f32 / bf16 lanes per vector;  pg32 all-true f32;  zero = f32 zero vector
+     *   i         query row;  jmax = # unmasked keys for row i (both masks fold to one whilelt bound)
+     *   lim       last LOCAL key index row i may attend under causality (key kj+lim <= qbase+i)
+     *   mv,mij    pass-1 running-max vector and its scalar reduce = this block's row max
+     *   mnew      new running max = max(m[i], mij);  mnv = its broadcast
+     *   alpha     rescale exp(m_old - mnew) applied to the OLD acc/l (0 on the row's first block)
+     *   Sr        &S[i][j];  e0,e1 = exp(S - mnew) for the two f32 halves, 0 where masked
+     *   p0,p1     per-half whilelt bounds;  s0,s1 = the two rowsum(P) accumulators. One contiguous
+     *             bf16 P vector is packed from e0,e1 via svcvt_bf16 + svuzp1 */
     int VLw = (int)svcntw(), VLh = (int)svcnth();
     svbool_t pg32 = svptrue_b32();
     svfloat32_t zero = svdup_n_f32(0);
